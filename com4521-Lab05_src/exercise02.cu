@@ -29,47 +29,11 @@ struct Sphere {
   float x, y, z;
 };
 
-enum AccessType {
-  kNormal,
-  kReadOnly,
-  kConst,
-};
-
-struct SphereBundle {
-  Sphere *normal_spheres;
-  const Sphere *__restrict__ readonly_spheres;
-  Sphere *const_spheres;
-};
-
 /* Device Code */
 
 __constant__ unsigned int d_sphere_count;
 
 __constant__ Sphere const_spheres[MAX_SPHERES];
-
-template <AccessType AT>
-__device__ Sphere GetSphere(int index, SphereBundle bundle);
-
-template <>
-__device__ Sphere GetSphere<kNormal>(int index, SphereBundle bundle) {
-  return bundle.normal_spheres[index];
-}
-
-template <>
-__device__ Sphere GetSphere<kReadOnly>(int index, SphereBundle bundle) {
-  static_assert(sizeof(Sphere) % sizeof(float) == 0, "");
-  Sphere ret;
-#pragma unroll
-  for (int i = 0; i < sizeof(Sphere) / sizeof(float); i++) {
-    ((float *)&ret)[i] = __ldg(((float *)&bundle.readonly_spheres[index]) + i);
-  }
-  return ret;
-}
-
-template <>
-__device__ Sphere GetSphere<kConst>(int index, SphereBundle bundle) {
-  return bundle.const_spheres[index];
-}
 
 #define SPHERE_INTERSECT(s, ox, oy, t, n)                        \
   do {                                                           \
@@ -84,68 +48,76 @@ __device__ Sphere GetSphere<kConst>(int index, SphereBundle bundle) {
     }                                                            \
   } while (0)
 
-template <AccessType AT>
-__global__ void RayTrace(uchar4 *image, SphereBundle bundle) {
-  // map from threadIdx/BlockIdx to pixel position
-  int x = threadIdx.x + blockIdx.x * blockDim.x;
-  int y = threadIdx.y + blockIdx.y * blockDim.y;
-  int offset = x + y * blockDim.x * gridDim.x;
-  float ox = (x - IMAGE_DIM / 2.0f);
-  float oy = (y - IMAGE_DIM / 2.0f);
+#define RAY_TRACE(image, spheres)                  \
+  do {                                             \
+    int x = threadIdx.x + blockIdx.x * blockDim.x; \
+    int y = threadIdx.y + blockIdx.y * blockDim.y; \
+    int offset = x + y * blockDim.x * gridDim.x;   \
+    float ox = (x - IMAGE_DIM / 2.0f);             \
+    float oy = (y - IMAGE_DIM / 2.0f);             \
+    float r = 0, g = 0, b = 0;                     \
+    float maxz = -INF;                             \
+    for (int i = 0; i < d_sphere_count; i++) {     \
+      float n, t;                                  \
+      SPHERE_INTERSECT(spheres[i], ox, oy, t, n);  \
+      if (t > maxz) {                              \
+        float fscale = n;                          \
+        r = spheres[i].r * fscale;                 \
+        g = spheres[i].g * fscale;                 \
+        b = spheres[i].b * fscale;                 \
+        maxz = t;                                  \
+      }                                            \
+    }                                              \
+    image[offset].x = (int)(r * 255);              \
+    image[offset].y = (int)(g * 255);              \
+    image[offset].z = (int)(b * 255);              \
+    image[offset].w = 255;                         \
+  } while (0)
 
-  float r = 0, g = 0, b = 0;
-  float maxz = -INF;
-  for (int i = 0; i < d_sphere_count; i++) {
-    Sphere s = GetSphere<AT>(i, bundle);
-    float n, t;
-    SPHERE_INTERSECT(s, ox, oy, t, n);
-    if (t > maxz) {
-      float fscale = n;
-      r = s.r * fscale;
-      g = s.g * fscale;
-      b = s.b * fscale;
-      maxz = t;
-    }
-  }
-
-  image[offset].x = (int)(r * 255);
-  image[offset].y = (int)(g * 255);
-  image[offset].z = (int)(b * 255);
-  image[offset].w = 255;
+__global__ void RayTraceReadOnly(uchar4 *image,
+                                 const Sphere *__restrict__ spheres) {
+  RAY_TRACE(image, spheres);
 }
+
+__global__ void RayTraceConst(uchar4 *image) {
+  RAY_TRACE(image, const_spheres);
+}
+
+__global__ void RayTraceNormal(uchar4 *image, Sphere *spheres) {
+  RAY_TRACE(image, spheres);
+}
+
+#define TIME(message, ms, func_name, a, b, ...) \
+  do {                                          \
+    cudaEvent_t start, stop;                    \
+    cudaEventCreate(&start);                    \
+    cudaEventCreate(&stop);                     \
+    cudaEventRecord(start, 0);                  \
+    func_name<<<a, b>>>(__VA_ARGS__);           \
+    cudaEventRecord(stop, 0);                   \
+    cudaEventSynchronize(stop);                 \
+    CheckCUDAError(message);                    \
+    cudaEventElapsedTime(&ms, start, stop);     \
+    cudaEventDestroy(start);                    \
+    cudaEventDestroy(stop);                     \
+  } while (0)
 
 /* Host code */
 
-SphereBundle Prepare(Sphere *h_s) {
-  auto size = MAX_SPHERES * sizeof(Sphere);
-  SphereBundle sphere_bundle;
-  cudaMalloc((void **)&sphere_bundle.normal_spheres, size);
-  CheckCUDAError("CUDA malloc");
-  sphere_bundle.readonly_spheres = sphere_bundle.normal_spheres;
-  cudaGetSymbolAddress((void **)&sphere_bundle.const_spheres, const_spheres);
-  CheckCUDAError("CUDA get symbol address");
-
-  cudaMemcpy(sphere_bundle.normal_spheres, h_s, size, cudaMemcpyHostToDevice);
-  cudaMemcpy(sphere_bundle.const_spheres, h_s, size, cudaMemcpyHostToDevice);
-  CheckCUDAError("CUDA memcpy to device");
-
-  return sphere_bundle;
-}
-
 int main(void) {
-  unsigned int image_size;
-  uchar4 *h_image, *d_image;
-  Sphere *h_s = (Sphere *)malloc(MAX_SPHERES * sizeof(Sphere));
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
+  unsigned int image_size = IMAGE_DIM * IMAGE_DIM * sizeof(uchar4);
+  unsigned int spheres_size = MAX_SPHERES * sizeof(Sphere);
 
   float3 timing_data;  // timing data where [0]=normal, [1]=read-only, [2]=const
+  uchar4 *h_image, *d_image;
+  Sphere *h_s, *d_s;
 
-  image_size = IMAGE_DIM * IMAGE_DIM * sizeof(uchar4);
+  h_s = (Sphere *)malloc(spheres_size);
 
   // allocate memory on the GPU for the output image
   cudaMalloc((void **)&d_image, image_size);
+  CheckCUDAError("CUDA malloc");
+  cudaMalloc(&d_s, spheres_size);
   CheckCUDAError("CUDA malloc");
 
   // create some random spheres
@@ -158,8 +130,10 @@ int main(void) {
     h_s[i].z = rnd((float)IMAGE_DIM) - (IMAGE_DIM / 2.0f);
     h_s[i].radius = rnd(100.0f) + 20;
   }
+
   // copy to device memory
-  auto bundle = Prepare(h_s);
+  cudaMemcpy(d_s, h_s, spheres_size, cudaMemcpyHostToDevice);
+  CheckCUDAError("CUDA memcpy");
 
   // generate host image
   h_image = (uchar4 *)malloc(image_size);
@@ -176,36 +150,25 @@ int main(void) {
     CheckCUDAError("CUDA copy sphere count to device");
 
     // generate a image from the sphere data
-    cudaEventRecord(start, 0);
-    RayTrace<kNormal><<<blocksPerGrid, threadsPerBlock>>>(d_image, bundle);
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&timing_data.x, start, stop);
-    CheckCUDAError("kernel (normal)");
+
+    TIME("kernel (normal)", timing_data.x, RayTraceNormal, blocksPerGrid,
+         threadsPerBlock, d_image, d_s);
 
     cudaMemcpy(h_image, d_image, image_size, cudaMemcpyDeviceToHost);
     CheckCUDAError("CUDA memcpy from device");
     OutputImageFile(h_image, std::string("normal.") +
                                  std::to_string(sphere_count) + ".ppm");
 
-    cudaEventRecord(start, 0);
-    RayTrace<kReadOnly><<<blocksPerGrid, threadsPerBlock>>>(d_image, bundle);
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&timing_data.y, start, stop);
-    CheckCUDAError("kernel (read only)");
+    TIME("kernel (read only)", timing_data.y, RayTraceReadOnly, blocksPerGrid,
+         threadsPerBlock, d_image, d_s);
 
     cudaMemcpy(h_image, d_image, image_size, cudaMemcpyDeviceToHost);
     CheckCUDAError("CUDA memcpy from device");
     OutputImageFile(h_image, std::string("readonly.") +
                                  std::to_string(sphere_count) + ".ppm");
 
-    cudaEventRecord(start, 0);
-    RayTrace<kConst><<<blocksPerGrid, threadsPerBlock>>>(d_image, bundle);
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&timing_data.z, start, stop);
-    CheckCUDAError("kernel (constant)");
+    TIME("kernel (constant)", timing_data.z, RayTraceConst, blocksPerGrid,
+         threadsPerBlock, d_image);
 
     cudaMemcpy(h_image, d_image, image_size, cudaMemcpyDeviceToHost);
     CheckCUDAError("CUDA memcpy from device");
@@ -216,11 +179,9 @@ int main(void) {
            timing_data.y, timing_data.z);
   }
 
-  // cleanup
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
   cudaFree(d_image);
   free(h_image);
+  free(h_s);
 
   return 0;
 }
