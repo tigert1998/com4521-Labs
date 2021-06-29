@@ -3,6 +3,8 @@
  * provided by permission of NVIDIA Corporation
  */
 
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 #include <vector_functions.h>
 #include <vector_types.h>
 
@@ -11,8 +13,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
+#include "header.cuh"
 
 #define IMAGE_DIM 2048
 #define MAX_SPHERES 2048
@@ -86,21 +87,6 @@ __global__ void RayTraceConst(uchar4 *image) {
 __global__ void RayTraceNormal(uchar4 *image, Sphere *spheres) {
   RAY_TRACE(image, spheres);
 }
-
-#define TIME(message, ms, func_name, a, b, ...) \
-  do {                                          \
-    cudaEvent_t start, stop;                    \
-    cudaEventCreate(&start);                    \
-    cudaEventCreate(&stop);                     \
-    cudaEventRecord(start, 0);                  \
-    func_name<<<a, b>>>(__VA_ARGS__);           \
-    cudaEventRecord(stop, 0);                   \
-    cudaEventSynchronize(stop);                 \
-    CheckCUDAError(message);                    \
-    cudaEventElapsedTime(&ms, start, stop);     \
-    cudaEventDestroy(start);                    \
-    cudaEventDestroy(stop);                     \
-  } while (0)
 
 /* Host code */
 
