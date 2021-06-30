@@ -155,20 +155,29 @@ __global__ void MatrixMulCUDASharedMemory() {
     }                                           \
   } while (0)
 
-void GetProperty() {
+void GetProperty(int *max_blocks_per_mp, int *max_threads_per_mp, int *num_mp) {
   int device;
   cudaGetDevice(&device);
 
   cudaDeviceProp props;
   cudaGetDeviceProperties(&props, device);
 
-  // TODO
+  printf("Device: %s\n", props.name);
+  *max_blocks_per_mp = props.maxBlocksPerMultiProcessor;
+  *max_threads_per_mp = props.maxThreadsPerMultiProcessor;
+  *num_mp = props.multiProcessorCount;
+
+  printf("max_blocks_per_mp: %d\n", *max_blocks_per_mp);
+  printf("max_threads_per_mp: %d\n", *max_threads_per_mp);
+  printf("num_mp: %d\n", *num_mp);
 }
 
 int main(int argc, char **argv) {
   unsigned int mem_size_a, mem_size_b, mem_size_c;
-  int max_active_blocks;
+  int max_active_blocks, max_blocks_per_mp, max_threads_per_mp, num_mp;
   float ms, occupancy;
+
+  GetProperty(&max_blocks_per_mp, &max_threads_per_mp, &num_mp);
 
   mem_size_a = sizeof(float) * A_WIDTH * A_HEIGHT;
   mem_size_b = sizeof(float) * B_WIDTH * B_HEIGHT;
@@ -196,10 +205,10 @@ int main(int argc, char **argv) {
   LOG_RES("MatrixMulCUDASharedMemory");
 
   // Compute the ocupancy
-  occupancy = 0;
-
-  // printf("Kernel time was %fms with theoretical occupancy of %f\n", ms,
-  //        occupancy);
+  occupancy = 1.0f * max_blocks_per_mp * (BLOCK_SIZE * BLOCK_SIZE) /
+              (max_threads_per_mp * num_mp);
+  printf("theoretical occupancy = %.6lf\n", occupancy);
+  return 0;
 }
 
 void CheckCUDAError(const char *msg) {
