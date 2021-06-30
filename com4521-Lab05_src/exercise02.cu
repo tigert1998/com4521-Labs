@@ -13,7 +13,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "header.cuh"
+#include "common.cuh"
 
 #define IMAGE_DIM 2048
 #define MAX_SPHERES 2048

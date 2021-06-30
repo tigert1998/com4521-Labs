@@ -10,7 +10,7 @@
 #include <cstring>
 #include <texture_fetch_functions.hpp>
 
-#include "header.cuh"
+#include "common.cuh"
 
 #define IMAGE_DIM 2048
 #define SAMPLE_SIZE 6
