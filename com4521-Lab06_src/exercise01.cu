@@ -65,11 +65,39 @@ class RowMajor {
   }
 };
 
+template <int R, int C, int B>
+class BlockedRowMajor {
+  static_assert((B & (B - 1)) == 0, "");
+
+ public:
+  __host__ __device__ inline static int Index(int x, int y) {
+    int bx = x / B;
+    int by = y / B;
+    int tx = x & (B - 1);
+    int ty = y & (B - 1);
+    return (bx * (C / B) + by) * B * B + (tx * B + ty);
+  }
+};
+
 template <int R, int C>
 class ColMajor {
  public:
   __host__ __device__ inline static int Index(int x, int y) {
     return x + y * R;
+  }
+};
+
+template <int R, int C, int B>
+class BlockedColMajor {
+  static_assert((B & (B - 1)) == 0, "");
+
+ public:
+  __host__ __device__ inline static int Index(int x, int y) {
+    int bx = x / B;
+    int by = y / B;
+    int tx = x & (B - 1);
+    int ty = y & (B - 1);
+    return (bx + by * (R / B)) * B * B + (tx + ty * B);
   }
 };
 
@@ -141,6 +169,9 @@ class Matrix : public Array<D, N> {
 
 template <typename D, int R, int C>
 class RowMajorMatrix : public Matrix<D, R, C, R * C, RowMajor<R, C>> {};
+template <typename D, int R, int C>
+class BlockedRowMajorMatrix
+    : public Matrix<D, R, C, R * C, BlockedRowMajor<R, C, 8>> {};
 
 template <typename D, int R, int C>
 class RowMajorMatrixWrapper : public Matrix<D, R, C, 0, RowMajor<R, C>> {
@@ -151,6 +182,9 @@ class RowMajorMatrixWrapper : public Matrix<D, R, C, 0, RowMajor<R, C>> {
 
 template <typename D, int R, int C>
 class ColMajorMatrix : public Matrix<D, R, C, R * C, ColMajor<R, C>> {};
+template <typename D, int R, int C>
+class BlockedColMajorMatrix
+    : public Matrix<D, R, C, R * C, BlockedColMajor<R, C, 8>> {};
 
 template <typename D, int R, int C>
 class ColMajorMatrixWrapper : public Matrix<D, R, C, 0, ColMajor<R, C>> {
@@ -159,18 +193,17 @@ class ColMajorMatrixWrapper : public Matrix<D, R, C, 0, ColMajor<R, C>> {
       : Matrix<D, R, C, 0, ColMajor<R, C>>(ptr) {}
 };
 
-ColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a;
-RowMajorMatrix<float, B_HEIGHT, B_WIDTH> *d_b;
-RowMajorMatrix<float, C_HEIGHT, C_WIDTH> *d_c;
+BlockedColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a;
+BlockedRowMajorMatrix<float, B_HEIGHT, B_WIDTH> *d_b;
+BlockedRowMajorMatrix<float, C_HEIGHT, C_WIDTH> *d_c;
 
-ColMajorMatrix<float, A_HEIGHT, A_WIDTH> h_a;
-RowMajorMatrix<float, B_HEIGHT, B_WIDTH> h_b;
-RowMajorMatrix<float, C_HEIGHT, C_WIDTH> h_c;
+BlockedColMajorMatrix<float, A_HEIGHT, A_WIDTH> h_a;
+BlockedRowMajorMatrix<float, B_HEIGHT, B_WIDTH> h_b;
+BlockedRowMajorMatrix<float, C_HEIGHT, C_WIDTH> h_c;
 RowMajorMatrix<float, C_HEIGHT, C_WIDTH> h_c_ref;
 
-__global__ void MatrixMulCUDA(ColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a,
-                              RowMajorMatrix<float, B_HEIGHT, B_WIDTH> *d_b,
-                              RowMajorMatrix<float, C_HEIGHT, C_WIDTH> *d_c) {
+template <typename M1, typename M2, typename M3>
+__global__ void MatrixMulCUDA(M1 *d_a, M2 *d_b, M3 *d_c) {
   // Block index
   int bx = blockIdx.x;
   int by = blockIdx.y;
@@ -189,10 +222,8 @@ __global__ void MatrixMulCUDA(ColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a,
   d_c->At(x, y) = tot;
 }
 
-__global__ void MatrixMulCUDASharedMemory(
-    ColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a,
-    RowMajorMatrix<float, B_HEIGHT, B_WIDTH> *d_b,
-    RowMajorMatrix<float, C_HEIGHT, C_WIDTH> *d_c) {
+template <typename M1, typename M2, typename M3>
+__global__ void MatrixMulCUDASharedMemory(M1 *d_a, M2 *d_b, M3 *d_c) {
   // Define some shared memory for a sub block of matrices A an B
   __shared__ float s_a_mem[BLOCK_SIZE * BLOCK_SIZE];
   __shared__ float s_b_mem[BLOCK_SIZE * BLOCK_SIZE];
