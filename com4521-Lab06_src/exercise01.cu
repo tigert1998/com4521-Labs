@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 #include "common.cuh"
 
@@ -27,59 +28,149 @@ static_assert(A_WIDTH % BLOCK_SIZE == 0 && A_HEIGHT % BLOCK_SIZE == 0 &&
                   B_HEIGHT % BLOCK_SIZE == 0,
               "matrix size is not a multiple of the block size");
 
-// matrix
-
-template <typename D, int NRows, int NCols>
-using RowMajorMatrix = D[NRows][NCols];
-
-template <typename D, int NRows, int NCols>
-using ColMajorMatrix = D[NCols][NRows];
-
-template <int NRows, int NCols>
-void RandInit(RowMajorMatrix<float, NRows, NCols> *matrix) {
-  for (int i = 0; i < NRows; i++)
-    for (int j = 0; j < NCols; j++) (*matrix)[i][j] = (float)rand() / RAND_MAX;
+void CheckCUDAError(const char *msg) {
+  cudaError_t err = cudaGetLastError();
+  if (cudaSuccess != err) {
+    fprintf(stderr, "CUDA ERROR: %s: %s.\n", msg, cudaGetErrorString(err));
+    exit(EXIT_FAILURE);
+  }
 }
 
-template <int NRows, int NCols>
-void RandInit(ColMajorMatrix<float, NRows, NCols> *matrix) {
-  for (int i = 0; i < NCols; i++)
-    for (int j = 0; j < NRows; j++) (*matrix)[i][j] = (float)rand() / RAND_MAX;
-}
+template <typename D, int N>
+class Array {
+ private:
+  D data_[N]{};
 
-void MatrixMulCPU(const ColMajorMatrix<float, A_HEIGHT, A_WIDTH> &a,
-                  const RowMajorMatrix<float, B_HEIGHT, B_WIDTH> &b,
-                  RowMajorMatrix<float, C_HEIGHT, C_WIDTH> *c) {
-  for (int i = 0; i < C_HEIGHT; i++)
-    for (int j = 0; j < C_WIDTH; j++) {
-      float tot = 0;
-      for (int k = 0; k < A_WIDTH; k++) tot += a[k][i] * b[k][j];
-      (*c)[i][j] = tot;
+ public:
+  __host__ __device__ const D *data() const { return data_; }
+  __host__ __device__ D *data() { return data_; }
+};
+
+template <typename D>
+class Array<D, 0> {
+ private:
+  D *ptr_ = nullptr;
+
+ public:
+  __host__ __device__ Array(D *ptr) : ptr_(ptr) {}
+  __host__ __device__ const D *data() const { return ptr_; }
+  __host__ __device__ D *data() { return ptr_; }
+};
+
+template <int R, int C>
+class RowMajor {
+ public:
+  __host__ __device__ inline static int Index(int x, int y) {
+    return x * C + y;
+  }
+};
+
+template <int R, int C>
+class ColMajor {
+ public:
+  __host__ __device__ inline static int Index(int x, int y) {
+    return x + y * R;
+  }
+};
+
+template <typename D, int R, int C, int N, typename Layout>
+class Matrix : public Array<D, N> {
+ public:
+  static constexpr int kNumRows = R;
+  static constexpr int kNumCols = C;
+
+  Matrix() = default;
+
+  __host__ __device__ Matrix(D *ptr) : Array<D, N>(ptr) {}
+
+  __host__ __device__ inline D &At(int x, int y) {
+    return Array<D, N>::data()[Layout::Index(x, y)];
+  }
+  __host__ __device__ inline D At(int x, int y) const {
+    return Array<D, N>::data()[Layout::Index(x, y)];
+  }
+
+  template <typename M>
+  bool Equal(const M &m) {
+    if (kNumRows == M::kNumRows && kNumCols == M::kNumCols) {
+      for (int i = 0; i < kNumRows; i++)
+        for (int j = 0; j < kNumCols; j++) {
+          if (std::fabs(At(i, j) - m.At(i, j)) >= 1e-3) {
+            return false;
+          }
+        }
+      return true;
     }
-}
+    return false;
+  }
 
-int MatrixMulTest(const RowMajorMatrix<float, C_HEIGHT, C_WIDTH> &c,
-                  const RowMajorMatrix<float, C_HEIGHT, C_WIDTH> &c_ref) {
-  int errors = 0;
-  for (int i = 0; i < C_HEIGHT; i++)
-    for (int j = 0; j < C_WIDTH; j++) {
-      errors += std::fabs(c[i][j] - c_ref[i][j]) >= 1e3;
-    }
-  return errors;
-}
+  template <typename M1, typename M2>
+  void Mul(const M1 &b, M2 *c) {
+    static_assert(kNumCols == M1::kNumRows && kNumRows == M2::kNumRows &&
+                      M1::kNumCols == M2::kNumCols,
+                  "invalid multiply shape");
+    for (int i = 0; i < M2::kNumRows; i++)
+      for (int j = 0; j < M2::kNumCols; j++) {
+        float tot = 0;
+        for (int k = 0; k < kNumCols; k++) tot += At(i, k) * b.At(k, j);
+        c->At(i, j) = tot;
+      }
+  }
 
-__device__ ColMajorMatrix<float, A_HEIGHT, A_WIDTH> d_a;
-__device__ RowMajorMatrix<float, B_HEIGHT, B_WIDTH> d_b;
-__device__ RowMajorMatrix<float, C_HEIGHT, C_WIDTH> d_c;
+  void Init() {
+    for (int i = 0; i < kNumRows; i++)
+      for (int j = 0; j < kNumCols; j++) {
+        At(i, j) = (float)rand() / RAND_MAX;
+      }
+  }
+
+  template <int M>
+  void ToDevice(Array<D, M> *symbol) {
+    cudaMemcpy(symbol->data(), this->data(), N * sizeof(D),
+               cudaMemcpyHostToDevice);
+    CheckCUDAError("Matrix::ToDevice");
+  }
+
+  template <int M>
+  void FromDevice(Array<D, M> *symbol) {
+    cudaMemcpy(this->data(), symbol->data(), N * sizeof(D),
+               cudaMemcpyDeviceToHost);
+    CheckCUDAError("Matrix::FromDevice");
+  }
+};
+
+template <typename D, int R, int C>
+class RowMajorMatrix : public Matrix<D, R, C, R * C, RowMajor<R, C>> {};
+
+template <typename D, int R, int C>
+class RowMajorMatrixWrapper : public Matrix<D, R, C, 0, RowMajor<R, C>> {
+ public:
+  __host__ __device__ RowMajorMatrixWrapper(D *ptr)
+      : Matrix<D, R, C, 0, RowMajor<R, C>>(ptr) {}
+};
+
+template <typename D, int R, int C>
+class ColMajorMatrix : public Matrix<D, R, C, R * C, ColMajor<R, C>> {};
+
+template <typename D, int R, int C>
+class ColMajorMatrixWrapper : public Matrix<D, R, C, 0, ColMajor<R, C>> {
+ public:
+  __host__ __device__ ColMajorMatrixWrapper(D *ptr)
+      : Matrix<D, R, C, 0, ColMajor<R, C>>(ptr) {}
+};
+
+ColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a;
+RowMajorMatrix<float, B_HEIGHT, B_WIDTH> *d_b;
+RowMajorMatrix<float, C_HEIGHT, C_WIDTH> *d_c;
 
 ColMajorMatrix<float, A_HEIGHT, A_WIDTH> h_a;
 RowMajorMatrix<float, B_HEIGHT, B_WIDTH> h_b;
 RowMajorMatrix<float, C_HEIGHT, C_WIDTH> h_c;
 RowMajorMatrix<float, C_HEIGHT, C_WIDTH> h_c_ref;
 
-void CheckCUDAError(const char *msg);
-
-__global__ void MatrixMulCUDA() {
+__global__ void MatrixMulCUDA(ColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a,
+                              RowMajorMatrix<float, B_HEIGHT, B_WIDTH> *d_b,
+                              RowMajorMatrix<float, C_HEIGHT, C_WIDTH> *d_c) {
   // Block index
   int bx = blockIdx.x;
   int by = blockIdx.y;
@@ -91,17 +182,23 @@ __global__ void MatrixMulCUDA() {
   float tot = 0;
   // iterate A_WIDTH (same as B_HEIGHT) to calculate the product
   for (int k = 0; k < A_WIDTH; k++) {
-    tot += d_a[k][x] * d_b[k][y];
+    tot += d_a->At(x, k) * d_b->At(k, y);
   }
 
   // Store the product value of C matrix
-  d_c[x][y] = tot;
+  d_c->At(x, y) = tot;
 }
 
-__global__ void MatrixMulCUDASharedMemory() {
+__global__ void MatrixMulCUDASharedMemory(
+    ColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a,
+    RowMajorMatrix<float, B_HEIGHT, B_WIDTH> *d_b,
+    RowMajorMatrix<float, C_HEIGHT, C_WIDTH> *d_c) {
   // Define some shared memory for a sub block of matrices A an B
-  __shared__ ColMajorMatrix<float, BLOCK_SIZE, BLOCK_SIZE> s_a;
-  __shared__ RowMajorMatrix<float, BLOCK_SIZE, BLOCK_SIZE> s_b;
+  __shared__ float s_a_mem[BLOCK_SIZE * BLOCK_SIZE];
+  __shared__ float s_b_mem[BLOCK_SIZE * BLOCK_SIZE];
+
+  ColMajorMatrixWrapper<float, BLOCK_SIZE, BLOCK_SIZE> s_a(s_a_mem);
+  RowMajorMatrixWrapper<float, BLOCK_SIZE, BLOCK_SIZE> s_b(s_b_mem);
 
   // Block index
   int bx = blockIdx.x;
@@ -113,20 +210,20 @@ __global__ void MatrixMulCUDASharedMemory() {
 
   // iterate through the number of sub matrices of A and B
   for (int i = 0; i < NUM_SUBS; i++) {
-    int a_x = tx + BLOCK_SIZE * i;
-    int a_y = ty + BLOCK_SIZE * bx;
+    int a_x = tx + BLOCK_SIZE * bx;
+    int a_y = ty + BLOCK_SIZE * i;
     int b_x = tx + BLOCK_SIZE * i;
     int b_y = ty + BLOCK_SIZE * by;
 
-    s_a[tx][ty] = d_a[a_x][a_y];
-    s_b[tx][ty] = d_b[b_x][b_y];
+    s_a.At(tx, ty) = d_a->At(a_x, a_y);
+    s_b.At(tx, ty) = d_b->At(b_x, b_y);
 
     // Sync to ensure sub matrix is fully loaded
     __syncthreads();
 
     // Sum products of A and B sub matrices
     for (int k = 0; k < BLOCK_SIZE; ++k) {
-      tot += s_a[k][tx] * s_b[k][ty];
+      tot += s_a.At(tx, k) * s_b.At(k, ty);
     }
 
     // Sync to prevent run ahead (blocks loading new SM values before others
@@ -139,20 +236,14 @@ __global__ void MatrixMulCUDASharedMemory() {
   int c_y = ty + BLOCK_SIZE * by;
 
   // Store the product value of C matrix
-  d_c[c_x][c_y] = tot;
+  d_c->At(c_x, c_y) = tot;
 }
 
-#define LOG_RES(name)                           \
-  do {                                          \
-    printf("%s: %fms\n", name, ms);             \
-    cudaMemcpyFromSymbol(h_c, d_c, mem_size_c); \
-    CheckCUDAError("CUDA memcpy results");      \
-    auto errors = MatrixMulTest(h_c, h_c_ref);  \
-    if (errors) {                               \
-      printf("%d ERRORS\n", errors);            \
-    } else {                                    \
-      printf("TEST PASSED\n");                  \
-    }                                           \
+#define LOG_RES(name)                               \
+  do {                                              \
+    printf("%s: %fms\n", name, ms);                 \
+    h_c.FromDevice(d_c);                            \
+    puts(h_c.Equal(h_c_ref) ? "PASSED" : "FAILED"); \
   } while (0)
 
 void GetProperty(int *max_blocks_per_mp, int *max_threads_per_mp, int *num_mp) {
@@ -173,35 +264,34 @@ void GetProperty(int *max_blocks_per_mp, int *max_threads_per_mp, int *num_mp) {
 }
 
 int main(int argc, char **argv) {
-  unsigned int mem_size_a, mem_size_b, mem_size_c;
   int max_active_blocks, max_blocks_per_mp, max_threads_per_mp, num_mp;
   float ms, occupancy;
 
   GetProperty(&max_blocks_per_mp, &max_threads_per_mp, &num_mp);
 
-  mem_size_a = sizeof(float) * A_WIDTH * A_HEIGHT;
-  mem_size_b = sizeof(float) * B_WIDTH * B_HEIGHT;
-  mem_size_c = sizeof(float) * C_WIDTH * C_HEIGHT;
+  cudaMalloc(&d_a, sizeof(decltype(*d_a)));
+  cudaMalloc(&d_b, sizeof(decltype(*d_b)));
+  cudaMalloc(&d_c, sizeof(decltype(*d_c)));
 
-  RandInit<A_HEIGHT, A_WIDTH>(&h_a);
-  RandInit<B_HEIGHT, B_WIDTH>(&h_b);
+  h_a.Init();
+  h_b.Init();
 
   // copy host memory to device
-  cudaMemcpyToSymbol(d_a, h_a, mem_size_a);
-  cudaMemcpyToSymbol(d_b, h_b, mem_size_b);
-  CheckCUDAError("CUDA memcpy");
+  h_a.ToDevice(d_a);
+  h_b.ToDevice(d_b);
 
-  MatrixMulCPU(h_a, h_b, &h_c_ref);
+  h_a.Mul(h_b, &h_c_ref);
 
   // Setup execution parameters
   dim3 block_size(BLOCK_SIZE, BLOCK_SIZE);
   dim3 grid_size(C_HEIGHT / BLOCK_SIZE, C_WIDTH / BLOCK_SIZE);
 
-  TIME("MatrixMulCUDA", ms, MatrixMulCUDA, grid_size, block_size);
+  TIME("MatrixMulCUDA", ms, MatrixMulCUDA, grid_size, block_size, d_a, d_b,
+       d_c);
   LOG_RES("MatrixMulCUDA");
 
   TIME("MatrixMulCUDASharedMemory", ms, MatrixMulCUDASharedMemory, grid_size,
-       block_size);
+       block_size, d_a, d_b, d_c);
   LOG_RES("MatrixMulCUDASharedMemory");
 
   // Compute the ocupancy
@@ -209,12 +299,4 @@ int main(int argc, char **argv) {
               (max_threads_per_mp * num_mp);
   printf("theoretical occupancy = %.6lf\n", occupancy);
   return 0;
-}
-
-void CheckCUDAError(const char *msg) {
-  cudaError_t err = cudaGetLastError();
-  if (cudaSuccess != err) {
-    fprintf(stderr, "CUDA ERROR: %s: %s.\n", msg, cudaGetErrorString(err));
-    exit(EXIT_FAILURE);
-  }
 }
