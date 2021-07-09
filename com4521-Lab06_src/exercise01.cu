@@ -20,7 +20,7 @@
 #define C_HEIGHT A_HEIGHT
 #define C_WIDTH B_WIDTH
 
-#define BLOCK_SIZE 8
+#define BLOCK_SIZE 16
 #define NUM_SUBS (A_WIDTH / BLOCK_SIZE)
 
 static_assert(A_WIDTH == B_HEIGHT, "A_HEIGHT != B_WIDTH");
@@ -171,7 +171,7 @@ template <typename D, int R, int C>
 class RowMajorMatrix : public Matrix<D, R, C, R * C, RowMajor<R, C>> {};
 template <typename D, int R, int C>
 class BlockedRowMajorMatrix
-    : public Matrix<D, R, C, R * C, BlockedRowMajor<R, C, 8>> {};
+    : public Matrix<D, R, C, R * C, BlockedRowMajor<R, C, BLOCK_SIZE>> {};
 
 template <typename D, int R, int C>
 class RowMajorMatrixWrapper : public Matrix<D, R, C, 0, RowMajor<R, C>> {
@@ -184,7 +184,7 @@ template <typename D, int R, int C>
 class ColMajorMatrix : public Matrix<D, R, C, R * C, ColMajor<R, C>> {};
 template <typename D, int R, int C>
 class BlockedColMajorMatrix
-    : public Matrix<D, R, C, R * C, BlockedColMajor<R, C, 8>> {};
+    : public Matrix<D, R, C, R * C, BlockedColMajor<R, C, BLOCK_SIZE>> {};
 
 template <typename D, int R, int C>
 class ColMajorMatrixWrapper : public Matrix<D, R, C, 0, ColMajor<R, C>> {
@@ -289,9 +289,15 @@ void GetProperty(int *max_blocks_per_mp, int *max_threads_per_mp, int *num_mp) {
   *max_threads_per_mp = props.maxThreadsPerMultiProcessor;
   *num_mp = props.multiProcessorCount;
 
+  cudaFuncCache func_cache = cudaFuncCachePreferEqual;
+  cudaDeviceSetCacheConfig(func_cache);
+  cudaDeviceGetCacheConfig(&func_cache);
+  CheckCUDAError("cudaDeviceGetCacheConfig");
+
   printf("max_blocks_per_mp: %d\n", *max_blocks_per_mp);
   printf("max_threads_per_mp: %d\n", *max_threads_per_mp);
   printf("num_mp: %d\n", *num_mp);
+  printf("cache_config: %d\n", func_cache);
 }
 
 int main(int argc, char **argv) {
