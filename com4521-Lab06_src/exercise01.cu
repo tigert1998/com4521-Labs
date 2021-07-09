@@ -28,14 +28,6 @@ static_assert(A_WIDTH % BLOCK_SIZE == 0 && A_HEIGHT % BLOCK_SIZE == 0 &&
                   B_HEIGHT % BLOCK_SIZE == 0,
               "matrix size is not a multiple of the block size");
 
-void CheckCUDAError(const char *msg) {
-  cudaError_t err = cudaGetLastError();
-  if (cudaSuccess != err) {
-    fprintf(stderr, "CUDA ERROR: %s: %s.\n", msg, cudaGetErrorString(err));
-    exit(EXIT_FAILURE);
-  }
-}
-
 template <typename D, int N>
 class Array {
  private:

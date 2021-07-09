@@ -1,51 +1,56 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
 // include kernels and cuda headers after definitions of structures
+#include "common.cuh"
 #include "kernels.cuh"
 
-void checkCUDAError(const char *);
-void readRecords(student_record *records);
+void ReadRecords(student_record *records);
 
-void maximumMark_atomic(student_records *, student_records *, student_records *,
-                        student_records *);
-void maximumMark_recursive(student_records *, student_records *,
-                           student_records *, student_records *);
+void MaximumMarkAtomic(student_records *, student_records *, student_records *,
+                       student_records *);
+void MaximumMarkRecursive(student_records *, student_records *,
+                          student_records *, student_records *);
 void maximumMark_SM(student_records *, student_records *, student_records *,
                     student_records *);
 void maximumMark_shuffle(student_records *, student_records *,
                          student_records *, student_records *);
 
 int main(void) {
-  student_record *recordsAOS;
+  student_record *records_aos;
   student_records *h_records;
   student_records *h_records_result;
   student_records *d_records;
   student_records *d_records_result;
 
   // host allocation
-  recordsAOS = (student_record *)malloc(sizeof(student_record) * NUM_RECORDS);
+  records_aos = (student_record *)malloc(sizeof(student_record) * NUM_RECORDS);
   h_records = (student_records *)malloc(sizeof(student_records));
   h_records_result = (student_records *)malloc(sizeof(student_records));
 
   // device allocation
   cudaMalloc((void **)&d_records, sizeof(student_records));
   cudaMalloc((void **)&d_records_result, sizeof(student_records));
-  checkCUDAError("CUDA malloc");
+  CheckCUDAError("CUDA malloc");
 
   // read file
-  readRecords(recordsAOS);
+  ReadRecords(records_aos);
 
-  // Exercise 1.1) Convert recordsAOS to a structure of arrays in h_records
+  // Exercise 1.1) Convert records_aos to a structure of arrays in h_records
+  for (int i = 0; i < NUM_RECORDS; i++) {
+    h_records->student_ids[i] = records_aos[i].student_id;
+    h_records->assignment_marks[i] = records_aos[i].assignment_mark;
+  }
 
   // free AOS as it is no longer needed
-  free(recordsAOS);
+  free(records_aos);
 
   // apply each approach in turn
-  maximumMark_atomic(h_records, h_records_result, d_records, d_records_result);
-  maximumMark_recursive(h_records, h_records_result, d_records,
-                        d_records_result);
+  MaximumMarkAtomic(h_records, h_records_result, d_records, d_records_result);
+  MaximumMarkRecursive(h_records, h_records_result, d_records,
+                       d_records_result);
   maximumMark_SM(h_records, h_records_result, d_records, d_records_result);
   maximumMark_shuffle(h_records, h_records_result, d_records, d_records_result);
 
@@ -54,23 +59,15 @@ int main(void) {
   free(h_records_result);
   cudaFree(d_records);
   cudaFree(d_records_result);
-  checkCUDAError("CUDA cleanup");
+  CheckCUDAError("CUDA cleanup");
 
   return 0;
 }
 
-void checkCUDAError(const char *msg) {
-  cudaError_t err = cudaGetLastError();
-  if (cudaSuccess != err) {
-    fprintf(stderr, "CUDA ERROR: %s: %s.\n", msg, cudaGetErrorString(err));
-    exit(EXIT_FAILURE);
-  }
-}
-
-void readRecords(student_record *records) {
-  FILE *f = NULL;
+void ReadRecords(student_record *records) {
+  FILE *f = nullptr;
   f = fopen("com4521.dat", "rb");  // read and binary flags
-  if (f == NULL) {
+  if (f == nullptr) {
     fprintf(stderr, "Error: Could not find com4521.dat file \n");
     exit(1);
   }
@@ -83,10 +80,10 @@ void readRecords(student_record *records) {
   fclose(f);
 }
 
-void maximumMark_atomic(student_records *h_records,
-                        student_records *h_records_result,
-                        student_records *d_records,
-                        student_records *d_records_result) {
+void MaximumMarkAtomic(student_records *h_records,
+                       student_records *h_records_result,
+                       student_records *d_records,
+                       student_records *d_records_result) {
   float max_mark;
   int max_mark_student_id;
   float time;
@@ -101,21 +98,21 @@ void maximumMark_atomic(student_records *h_records,
   // memory copy records to device
   cudaMemcpy(d_records, h_records, sizeof(student_records),
              cudaMemcpyHostToDevice);
-  checkCUDAError("1) CUDA memcpy");
+  CheckCUDAError("1) CUDA memcpy");
 
   cudaEventRecord(start, 0);
   // find highest mark using GPU
-  dim3 blocksPerGrid(NUM_RECORDS / THREADS_PER_BLOCK, 1, 1);
-  dim3 threadsPerBlock(THREADS_PER_BLOCK, 1, 1);
-  maximumMark_atomic_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_records);
+  dim3 blocks_per_grid(NUM_RECORDS / THREADS_PER_BLOCK, 1, 1);
+  dim3 threads_per_block(THREADS_PER_BLOCK, 1, 1);
+  MaximumMarkAtomicKernel<<<blocks_per_grid, threads_per_block>>>(d_records);
   cudaDeviceSynchronize();
-  checkCUDAError("Atomics: CUDA kernel");
+  CheckCUDAError("Atomics: CUDA kernel");
 
   // Copy result back to host
   cudaMemcpyFromSymbol(&max_mark, d_max_mark, sizeof(float));
   cudaMemcpyFromSymbol(&max_mark_student_id, d_max_mark_student_id,
                        sizeof(int));
-  checkCUDAError("Atomics: CUDA memcpy back");
+  CheckCUDAError("Atomics: CUDA memcpy back");
 
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
@@ -131,19 +128,23 @@ void maximumMark_atomic(student_records *h_records,
 }
 
 // Exercise 2)
-void maximumMark_recursive(student_records *h_records,
-                           student_records *h_records_result,
-                           student_records *d_records,
-                           student_records *d_records_result) {
+void MaximumMarkRecursive(student_records *h_records,
+                          student_records *h_records_result,
+                          student_records *d_records,
+                          student_records *d_records_result) {
   int i;
   float max_mark;
   int max_mark_student_id;
-  student_records *d_records_temp;
+  student_records *d_records_temp1, *d_records_temp2;
   float time;
   cudaEvent_t start, stop;
 
   max_mark = 0;
-  max_mark_student_id = 0.0f;
+  max_mark_student_id = 0;
+
+  cudaMalloc(&d_records_temp1, sizeof(student_records));
+  cudaMalloc(&d_records_temp2, sizeof(student_records));
+  CheckCUDAError("malloc d_records_temp");
 
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
@@ -151,20 +152,46 @@ void maximumMark_recursive(student_records *h_records,
   // memory copy records to device
   cudaMemcpy(d_records, h_records, sizeof(student_records),
              cudaMemcpyHostToDevice);
-  checkCUDAError("Recursive: CUDA memcpy");
+  CheckCUDAError("Recursive: CUDA memcpy");
 
   cudaEventRecord(start, 0);
 
   // Exercise 2.3) Recursively call GPU steps until there are THREADS_PER_BLOCK
   // values left
+  dim3 blocks_per_grid(NUM_RECORDS / THREADS_PER_BLOCK, 1, 1);
+  dim3 threads_per_block(THREADS_PER_BLOCK, 1, 1);
+  MaximumMarkRecursiveKernel<<<blocks_per_grid, threads_per_block>>>(
+      d_records, d_records_temp2);
 
-  // Exercise 2.4) copy back the final THREADS_PER_BLOCK values
+  for (int i = NUM_RECORDS / 2; i > THREADS_PER_BLOCK; i /= 2) {
+    std::swap(d_records_temp1, d_records_temp2);
+    blocks_per_grid = dim3(i / THREADS_PER_BLOCK, 1, 1);
+    threads_per_block = dim3(THREADS_PER_BLOCK, 1, 1);
+    MaximumMarkRecursiveKernel<<<blocks_per_grid, threads_per_block>>>(
+        d_records_temp1, d_records_temp2);
+  }
 
-  // Exercise 2.5) reduce the final THREADS_PER_BLOCK values on CPU
+  cudaDeviceSynchronize();
 
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&time, start, stop);
+
+  // Exercise 2.4) copy back the final THREADS_PER_BLOCK values
+  cudaMemcpy(h_records_result, d_records_temp2, sizeof(student_records),
+             cudaMemcpyDeviceToHost);
+  CheckCUDAError("memcpy to h_records_result");
+  cudaFree(d_records_temp1);
+  cudaFree(d_records_temp2);
+
+  // Exercise 2.5) reduce the final THREADS_PER_BLOCK values on CPU
+
+  for (int i = 0; i < THREADS_PER_BLOCK; i++) {
+    if (h_records_result->assignment_marks[i] > max_mark) {
+      max_mark = h_records_result->assignment_marks[i];
+      max_mark_student_id = h_records_result->student_ids[i];
+    }
+  }
 
   // output the result
   printf("Recursive: Highest mark recorded %f was by student %d\n", max_mark,
@@ -195,7 +222,7 @@ void maximumMark_SM(student_records *h_records,
   // memory copy records to device
   cudaMemcpy(d_records, h_records, sizeof(student_records),
              cudaMemcpyHostToDevice);
-  checkCUDAError("SM: CUDA memcpy");
+  CheckCUDAError("SM: CUDA memcpy");
 
   cudaEventRecord(start, 0);
 
@@ -239,7 +266,7 @@ void maximumMark_shuffle(student_records *h_records,
   // memory copy records to device
   cudaMemcpy(d_records, h_records, sizeof(student_records),
              cudaMemcpyHostToDevice);
-  checkCUDAError("Shuffle: CUDA memcpy");
+  CheckCUDAError("Shuffle: CUDA memcpy");
 
   cudaEventRecord(start, 0);
 

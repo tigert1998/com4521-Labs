@@ -22,9 +22,6 @@ struct student_records {
   float assignment_marks[NUM_RECORDS];
 };
 
-typedef struct student_record student_record;
-typedef struct student_records student_records;
-
 __device__ float d_max_mark = 0;
 __device__ int d_max_mark_student_id = 0;
 
@@ -35,7 +32,7 @@ __device__ volatile int lock = UNLOCKED;
 
 // Function creates an atomic compare and swap to save the maximum mark and
 // associated student id
-__device__ void setMaxMarkAtomic(float mark, int id) {
+__device__ void SetMaxMarkAtomic(float mark, int id) {
   bool needlock = true;
 
   while (needlock) {
@@ -55,23 +52,40 @@ __device__ void setMaxMarkAtomic(float mark, int id) {
 }
 
 // Naive atomic implementation
-__global__ void maximumMark_atomic_kernel(student_records *d_records) {
+__global__ void MaximumMarkAtomicKernel(student_records *d_records) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   float mark = d_records->assignment_marks[idx];
   int id = d_records->student_ids[idx];
 
-  setMaxMarkAtomic(mark, id);
+  SetMaxMarkAtomic(mark, id);
 }
 
 // Exercise 2) Recursive Reduction
-__global__ void maximumMark_recursive_kernel(
-    student_records *d_records, student_records *d_reduced_records) {
+__global__ void MaximumMarkRecursiveKernel(student_records *d_records,
+                                           student_records *d_reduced_records) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   // Exercise 2.1) Load a single student record into shared memory
+  __shared__ student_record s_records[THREADS_PER_BLOCK];
+
+  s_records[threadIdx.x] = {
+      .student_id = d_records->student_ids[idx],
+      .assignment_mark = d_records->assignment_marks[idx],
+  };
+  __syncthreads();
 
   // Exercise 2.2) Compare two values and write the result to d_reduced_records
+  if ((idx & 1) == 0) {
+    d_reduced_records->assignment_marks[idx >> 1] =
+        max(s_records[threadIdx.x].assignment_mark,
+            s_records[threadIdx.x | 1].assignment_mark);
+    d_reduced_records->student_ids[idx >> 1] =
+        s_records[threadIdx.x].assignment_mark >
+                s_records[threadIdx.x | 1].assignment_mark
+            ? s_records[threadIdx.x].student_id
+            : s_records[threadIdx.x | 1].student_id;
+  }
 }
 
 // Exercise 3) Using block level reduction

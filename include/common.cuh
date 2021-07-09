@@ -16,4 +16,12 @@
     cudaEventDestroy(stop);                                      \
   } while (0)
 
+inline void CheckCUDAError(const char *msg) {
+  cudaError_t err = cudaGetLastError();
+  if (cudaSuccess != err) {
+    fprintf(stderr, "CUDA ERROR: %s: %s.\n", msg, cudaGetErrorString(err));
+    exit(EXIT_FAILURE);
+  }
+}
+
 #endif
