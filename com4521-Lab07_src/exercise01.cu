@@ -13,10 +13,10 @@ void MaximumMarkAtomic(student_records *, student_records *, student_records *,
                        student_records *);
 void MaximumMarkRecursive(student_records *, student_records *,
                           student_records *, student_records *);
-void maximumMark_SM(student_records *, student_records *, student_records *,
-                    student_records *);
-void maximumMark_shuffle(student_records *, student_records *,
-                         student_records *, student_records *);
+void MaximumMarkSM(student_records *, student_records *, student_records *,
+                   student_records *);
+void MaximumMarkShuffle(student_records *, student_records *, student_records *,
+                        student_records *);
 
 int main(void) {
   student_record *records_aos;
@@ -51,8 +51,8 @@ int main(void) {
   MaximumMarkAtomic(h_records, h_records_result, d_records, d_records_result);
   MaximumMarkRecursive(h_records, h_records_result, d_records,
                        d_records_result);
-  maximumMark_SM(h_records, h_records_result, d_records, d_records_result);
-  maximumMark_shuffle(h_records, h_records_result, d_records, d_records_result);
+  MaximumMarkSM(h_records, h_records_result, d_records, d_records_result);
+  MaximumMarkShuffle(h_records, h_records_result, d_records, d_records_result);
 
   // Cleanup
   free(h_records);
@@ -108,14 +108,15 @@ void MaximumMarkAtomic(student_records *h_records,
   cudaDeviceSynchronize();
   CheckCUDAError("Atomics: CUDA kernel");
 
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+
   // Copy result back to host
   cudaMemcpyFromSymbol(&max_mark, d_max_mark, sizeof(float));
   cudaMemcpyFromSymbol(&max_mark_student_id, d_max_mark_student_id,
                        sizeof(int));
   CheckCUDAError("Atomics: CUDA memcpy back");
 
-  cudaEventRecord(stop, 0);
-  cudaEventSynchronize(stop);
   cudaEventElapsedTime(&time, start, stop);
 
   // output result
@@ -203,10 +204,10 @@ void MaximumMarkRecursive(student_records *h_records,
 }
 
 // Exercise 3)
-void maximumMark_SM(student_records *h_records,
-                    student_records *h_records_result,
-                    student_records *d_records,
-                    student_records *d_records_result) {
+void MaximumMarkSM(student_records *h_records,
+                   student_records *h_records_result,
+                   student_records *d_records,
+                   student_records *d_records_result) {
   unsigned int i;
   float max_mark;
   int max_mark_student_id;
@@ -227,13 +228,26 @@ void maximumMark_SM(student_records *h_records,
   cudaEventRecord(start, 0);
 
   // Exercise 3.4) Call the shared memory reduction kernel
-
-  // Exercise 3.5) Copy the final block values back to CPU
-
-  // Exercise 3.6) Reduce the block level results on CPU
-
+  dim3 blocks_per_grid(NUM_RECORDS / THREADS_PER_BLOCK, 1, 1);
+  dim3 threads_per_block(THREADS_PER_BLOCK, 1, 1);
+  MaximumMarkSMKernel<<<blocks_per_grid, threads_per_block>>>(d_records,
+                                                              d_records_result);
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
+
+  // Exercise 3.5) Copy the final block values back to CPU
+  cudaMemcpy(h_records_result, d_records_result, sizeof(student_records),
+             cudaMemcpyDeviceToHost);
+  CheckCUDAError("memcpy to h_records_result");
+
+  // Exercise 3.6) Reduce the block level results on CPU
+  for (int i = 0; i < blocks_per_grid.x; i++) {
+    if (h_records_result->assignment_marks[i] > max_mark) {
+      max_mark = h_records_result->assignment_marks[i];
+      max_mark_student_id = h_records_result->student_ids[i];
+    }
+  }
+
   cudaEventElapsedTime(&time, start, stop);
 
   // output result
@@ -246,10 +260,10 @@ void maximumMark_SM(student_records *h_records,
 }
 
 // Exercise 4)
-void maximumMark_shuffle(student_records *h_records,
-                         student_records *h_records_result,
-                         student_records *d_records,
-                         student_records *d_records_result) {
+void MaximumMarkShuffle(student_records *h_records,
+                        student_records *h_records_result,
+                        student_records *d_records,
+                        student_records *d_records_result) {
   unsigned int i;
   unsigned int warps_per_grid;
   float max_mark;
@@ -270,12 +284,26 @@ void maximumMark_shuffle(student_records *h_records,
 
   cudaEventRecord(start, 0);
 
+  dim3 blocks_per_grid(NUM_RECORDS / THREADS_PER_BLOCK, 1, 1);
+  dim3 threads_per_block(THREADS_PER_BLOCK, 1, 1);
+  MaximumMarkShuffleKernel<<<blocks_per_grid, threads_per_block>>>(
+      d_records, d_records_result);
   // Exercise 4.2) Execute the kernel, copy back result, reduce final values on
   // CPU
 
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&time, start, stop);
+
+  cudaMemcpy(h_records_result, d_records_result, sizeof(student_records),
+             cudaMemcpyDeviceToHost);
+  CheckCUDAError("memcpy to h_records_result");
+  for (int i = 0; i < NUM_RECORDS >> 5; i++) {
+    if (h_records_result->assignment_marks[i] > max_mark) {
+      max_mark = h_records_result->assignment_marks[i];
+      max_mark_student_id = h_records_result->student_ids[i];
+    }
+  }
 
   // output result
   printf("Shuffle: Highest mark recorded %f was by student %d\n", max_mark,

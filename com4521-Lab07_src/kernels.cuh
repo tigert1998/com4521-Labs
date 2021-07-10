@@ -89,21 +89,67 @@ __global__ void MaximumMarkRecursiveKernel(student_records *d_records,
 }
 
 // Exercise 3) Using block level reduction
-__global__ void maximumMark_SM_kernel(student_records *d_records,
-                                      student_records *d_reduced_records) {
+__global__ void MaximumMarkSMKernel(student_records *d_records,
+                                    student_records *d_reduced_records) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   // Exercise 3.1) Load a single student record into shared memory
+  __shared__ int ids[THREADS_PER_BLOCK];
+  __shared__ float marks[THREADS_PER_BLOCK];
+  ids[threadIdx.x] = d_records->student_ids[idx];
+  marks[threadIdx.x] = d_records->assignment_marks[idx];
+  __syncthreads();
 
   // Exercise 3.2) Strided shared memory conflict free reduction
+  static_assert(THREADS_PER_BLOCK == 256, "");
+#pragma unroll
+  for (int i = 0; i <= 7; i++) {
+    int stride = 1 << (7 - i);
+
+    if (threadIdx.x < stride) {
+      ids[threadIdx.x] = marks[threadIdx.x + stride] > marks[threadIdx.x]
+                             ? ids[threadIdx.x + stride]
+                             : ids[threadIdx.x];
+      marks[threadIdx.x] = max(marks[threadIdx.x + stride], marks[threadIdx.x]);
+    }
+
+    __syncthreads();
+  }
 
   // Exercise 3.3) Write the result
+  if (threadIdx.x == 0) {
+    d_reduced_records->student_ids[blockIdx.x] = ids[0];
+    d_reduced_records->assignment_marks[blockIdx.x] = marks[0];
+  }
 }
 
 // Exercise 4) Using warp level reduction
-__global__ void maximumMark_shuffle_kernel(student_records *d_records,
-                                           student_records *d_reduced_records) {
+__global__ void MaximumMarkShuffleKernel(student_records *d_records,
+                                         student_records *d_reduced_records) {
   // Exercise 4.1) Complete the kernel
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int id = d_records->student_ids[idx];
+  float mark = d_records->assignment_marks[idx];
+
+  static_assert(THREADS_PER_BLOCK == 256, "");
+
+  constexpr unsigned kFullMask = (unsigned int)((1ll << 32) - 1);
+
+#pragma unroll
+  for (int i = 0; i <= 7; i++) {
+    int mask = 1 << (7 - i);
+
+    int oid = __shfl_xor_sync(kFullMask, id, mask);
+    float omark = __shfl_xor_sync(kFullMask, mark, mask);
+
+    id = mark > omark ? id : oid;
+    mark = max(mark, omark);
+  }
+
+  if ((idx & 31) == 0) {
+    d_reduced_records->student_ids[idx >> 5] = id;
+    d_reduced_records->assignment_marks[idx >> 5] = mark;
+  }
 }
 
 #endif  // KERNEL_H
