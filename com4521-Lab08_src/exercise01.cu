@@ -1,13 +1,17 @@
-#include <ctype.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <tuple>
 
 // CUDA runtime
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
 #include "common.cuh"
+
+using std::pair;
 
 typedef enum {
   CALCULATOR_ADD,
@@ -20,7 +24,6 @@ typedef enum { INPUT_RANDOM, INPUT_LINEAR } INPUT_TYPE;
 
 #define SAMPLES 262144
 #define TPB 256
-#define NUM_STREAMS 2
 #define FILE_BUFFER_SIZE 32
 #define MAX_COMMANDS 32
 #define INPUT INPUT_LINEAR
@@ -28,15 +31,17 @@ typedef enum { INPUT_RANDOM, INPUT_LINEAR } INPUT_TYPE;
 __constant__ CALCULATOR_COMMANDS d_commands[MAX_COMMANDS];
 __constant__ float d_operands[MAX_COMMANDS];
 
+int NUM_STREAMS;
+
 int readCommandsFromFile(CALCULATOR_COMMANDS *commands, float *operands);
 void InitInput(float *input);
 int ReadLine(FILE *f, char buffer[]);
-void cudaCalculatorDefaultStream(CALCULATOR_COMMANDS *commands, float *operands,
-                                 int num_commands);
-void cudaCalculatorNStream1(CALCULATOR_COMMANDS *commands, float *operands,
-                            int num_commands);
-void cudaCalculatorNStream2(CALCULATOR_COMMANDS *commands, float *operands,
-                            int num_commands);
+pair<float, int> cudaCalculatorDefaultStream(CALCULATOR_COMMANDS *commands,
+                                             float *operands, int num_commands);
+pair<float, int> cudaCalculatorNStream1(CALCULATOR_COMMANDS *commands,
+                                        float *operands, int num_commands);
+pair<float, int> cudaCalculatorNStream2(CALCULATOR_COMMANDS *commands,
+                                        float *operands, int num_commands);
 int CheckResults(float *h_input, float *h_output, CALCULATOR_COMMANDS *commands,
                  float *operands, int num_commands);
 
@@ -78,6 +83,30 @@ __global__ void ParallelCalculator(float *input, float *output,
   output[idx] = out;
 }
 
+void Benchmark(const char *name, int warmup_runs, int num_runs,
+               const std::function<pair<float, int>(CALCULATOR_COMMANDS *,
+                                                    float *, int)> &func,
+               CALCULATOR_COMMANDS *h_commands, float *h_operands,
+               int num_commands) {
+  for (int i = 0; i < warmup_runs; i++) {
+    int errors;
+    std::tie(std::ignore, errors) = func(h_commands, h_operands, num_commands);
+    if (errors > 0) {
+      printf("[%s] %d errors\n", name, errors);
+      exit(1);
+    }
+  }
+
+  double tot = 0;
+  for (int i = 0; i < num_runs; i++) {
+    float ms;
+    std::tie(ms, std::ignore) = func(h_commands, h_operands, num_commands);
+    tot += ms;
+  }
+  tot /= num_runs;
+  printf("[%s] #streams: %d, %.6fms\n", name, NUM_STREAMS, tot);
+}
+
 int main(int argc, char **argv) {
   int num_commands;
 
@@ -96,18 +125,20 @@ int main(int argc, char **argv) {
   cudaMemcpyToSymbol(d_operands, h_operands, sizeof(float) * MAX_COMMANDS);
   CheckCUDAError("Commands copy to constant memory");
 
-  // perform fully synchronous version
-  cudaCalculatorDefaultStream(h_commands, h_operands, num_commands);
-
-  // perform asynchronous version
-  cudaCalculatorNStream1(h_commands, h_operands, num_commands);
-
-  // perform asynchronous version
-  cudaCalculatorNStream2(h_commands, h_operands, num_commands);
+  for (int i : {2, 4, 8}) {
+    NUM_STREAMS = i;
+    Benchmark("DefaultStream", 10, 100, cudaCalculatorDefaultStream, h_commands,
+              h_operands, num_commands);
+    Benchmark("NStream1", 10, 100, cudaCalculatorNStream1, h_commands,
+              h_operands, num_commands);
+    Benchmark("NStream2", 10, 100, cudaCalculatorNStream2, h_commands,
+              h_operands, num_commands);
+  }
 }
 
-void cudaCalculatorDefaultStream(CALCULATOR_COMMANDS *commands, float *operands,
-                                 int num_commands) {
+pair<float, int> cudaCalculatorDefaultStream(CALCULATOR_COMMANDS *commands,
+                                             float *operands,
+                                             int num_commands) {
   float *h_input, *h_output;
   float *d_input, *d_output;
   float time;
@@ -155,23 +186,24 @@ void cudaCalculatorDefaultStream(CALCULATOR_COMMANDS *commands, float *operands,
 
   // check for errors and print timing
   errors = CheckResults(h_input, h_output, commands, operands, num_commands);
-  printf("Synchronous V Completed in %fms with %d errors\n", time, errors);
 
   // cleanup
   cudaFree(d_input);
   cudaFree(d_output);
   free(h_input);
   free(h_output);
+  return {time, errors};
 }
 
-void cudaCalculatorNStream1(CALCULATOR_COMMANDS *commands, float *operands,
-                            int num_commands) {
+pair<float, int> cudaCalculatorNStream1(CALCULATOR_COMMANDS *commands,
+                                        float *operands, int num_commands) {
   float *h_input, *h_output;
   float *d_input, *d_output;
   float time;
   cudaEvent_t start, stop;
   int i, errors;
-  cudaStream_t streams[NUM_STREAMS];
+
+  cudaStream_t *streams = new cudaStream_t[NUM_STREAMS];
 
   // init cuda events
   cudaEventCreate(&start);
@@ -198,13 +230,13 @@ void cudaCalculatorNStream1(CALCULATOR_COMMANDS *commands, float *operands,
 
   // Exercise 2.3) Loop through the streams and schedule a H2D copy, kernel
   // execution and D2H copy
-  int samples_per_stream = SAMPLES / NUM_STREAMS;
+  int batch_samples = SAMPLES / NUM_STREAMS;
   for (i = 0; i < NUM_STREAMS; i++) {
     // Stage 1) Asynchronous host to device memory copy
-    float *d_input_i = d_input + samples_per_stream * i;
-    float *d_output_i = d_output + samples_per_stream * i;
-    float *h_input_i = h_input + samples_per_stream * i;
-    float *h_output_i = h_output + samples_per_stream * i;
+    float *d_input_i = d_input + batch_samples * i;
+    float *d_output_i = d_output + batch_samples * i;
+    float *h_input_i = h_input + batch_samples * i;
+    float *h_output_i = h_output + batch_samples * i;
 
     cudaMemcpyAsync(d_input_i, h_input_i, size / NUM_STREAMS,
                     cudaMemcpyHostToDevice, streams[i]);
@@ -229,8 +261,6 @@ void cudaCalculatorNStream1(CALCULATOR_COMMANDS *commands, float *operands,
 
   // check for errors and print timing
   errors = CheckResults(h_input, h_output, commands, operands, num_commands);
-  printf("Async V1 (%d streams) Completed in %fms with %d errors\n",
-         NUM_STREAMS, time, errors);
 
   // Exercise 2.4)
   // Cleanup by destroying each stream
@@ -238,21 +268,24 @@ void cudaCalculatorNStream1(CALCULATOR_COMMANDS *commands, float *operands,
     cudaStreamDestroy(streams[i]);
     CheckCUDAError("cudaStreamDestroy");
   }
+  delete[] streams;
 
   cudaFree(d_input);
   cudaFree(d_output);
   cudaFreeHost(h_input);
   cudaFreeHost(h_output);
+
+  return {time, errors};
 }
 
-void cudaCalculatorNStream2(CALCULATOR_COMMANDS *commands, float *operands,
-                            int num_commands) {
+pair<float, int> cudaCalculatorNStream2(CALCULATOR_COMMANDS *commands,
+                                        float *operands, int num_commands) {
   float *h_input, *h_output;
   float *d_input, *d_output;
   float time;
   cudaEvent_t start, stop;
   int i, errors;
-  cudaStream_t streams[NUM_STREAMS];
+  cudaStream_t *streams = new cudaStream_t[NUM_STREAMS];
 
   // init cuda events
   cudaEventCreate(&start);
@@ -310,19 +343,19 @@ void cudaCalculatorNStream2(CALCULATOR_COMMANDS *commands, float *operands,
 
   // check for errors and print timing
   errors = CheckResults(h_input, h_output, commands, operands, num_commands);
-  printf("Async V2 (%d streams) Completed in %fms with %d errors\n",
-         NUM_STREAMS, time, errors);
 
   // TODO: Cleanup by destroying each stream
   for (int i = 0; i < NUM_STREAMS; i++) {
     cudaStreamDestroy(streams[i]);
     CheckCUDAError("cudaStreamDestroy");
   }
+  delete[] streams;
 
   cudaFree(d_input);
   cudaFree(d_output);
   cudaFreeHost(h_input);
   cudaFreeHost(h_output);
+  return {time, errors};
 }
 
 int readCommandsFromFile(CALCULATOR_COMMANDS *commands, float *operands) {
