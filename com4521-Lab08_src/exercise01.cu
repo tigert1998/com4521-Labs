@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
   cudaMemcpyToSymbol(d_operands, h_operands, sizeof(float) * MAX_COMMANDS);
   CheckCUDAError("Commands copy to constant memory");
 
-  for (int i : {2, 4, 8}) {
+  for (int i : {2, 4, 8, 16}) {
     NUM_STREAMS = i;
     Benchmark("DefaultStream", 10, 100, cudaCalculatorDefaultStream, h_commands,
               h_operands, num_commands);

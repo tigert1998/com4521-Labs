@@ -2,6 +2,7 @@
 #define __CUDACC__
 #endif
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <type_traits>
 
 #include "common.cuh"
@@ -93,11 +95,12 @@ class BlockedColMajor {
   }
 };
 
-template <typename D, int R, int C, int N, typename Layout>
+template <typename D, int R, int C, int N, typename L>
 class Matrix : public Array<D, N> {
  public:
   static constexpr int kNumRows = R;
   static constexpr int kNumCols = C;
+  using Layout = L;
 
   Matrix() = default;
 
@@ -185,13 +188,13 @@ class ColMajorMatrixWrapper : public Matrix<D, R, C, 0, ColMajor<R, C>> {
       : Matrix<D, R, C, 0, ColMajor<R, C>>(ptr) {}
 };
 
-BlockedColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a;
-BlockedRowMajorMatrix<float, B_HEIGHT, B_WIDTH> *d_b;
-BlockedRowMajorMatrix<float, C_HEIGHT, C_WIDTH> *d_c;
+ColMajorMatrix<float, A_HEIGHT, A_WIDTH> *d_a;
+RowMajorMatrix<float, B_HEIGHT, B_WIDTH> *d_b;
+RowMajorMatrix<float, C_HEIGHT, C_WIDTH> *d_c;
 
-BlockedColMajorMatrix<float, A_HEIGHT, A_WIDTH> h_a;
-BlockedRowMajorMatrix<float, B_HEIGHT, B_WIDTH> h_b;
-BlockedRowMajorMatrix<float, C_HEIGHT, C_WIDTH> h_c;
+ColMajorMatrix<float, A_HEIGHT, A_WIDTH> h_a;
+RowMajorMatrix<float, B_HEIGHT, B_WIDTH> h_b;
+RowMajorMatrix<float, C_HEIGHT, C_WIDTH> h_c;
 RowMajorMatrix<float, C_HEIGHT, C_WIDTH> h_c_ref;
 
 template <typename M1, typename M2, typename M3>
@@ -292,6 +295,55 @@ void GetProperty(int *max_blocks_per_mp, int *max_threads_per_mp, int *num_mp) {
   printf("cache_config: %d\n", func_cache);
 }
 
+void CheckoutCublas() {
+  constexpr int M = h_a.kNumRows;
+  constexpr int K = h_a.kNumCols;
+  constexpr int N = h_b.kNumCols;
+  static_assert(std::is_same<std::remove_reference_t<decltype(*d_a)>,
+                             ColMajorMatrix<float, M, K>>::value,
+                "");
+  static_assert(std::is_same<std::remove_reference_t<decltype(*d_b)>,
+                             RowMajorMatrix<float, K, N>>::value,
+                "");
+
+  float *d_c_mem;
+  cudaMalloc(&d_c_mem, M * N * sizeof(float));
+  CheckCUDAError("cudaMalloc");
+  ColMajorMatrixWrapper<float, M, N> d_c(d_c_mem);
+  auto h_c = std::make_unique<ColMajorMatrix<float, M, N>>();
+
+  cublasHandle_t handle;
+  cublasCreate(&handle);
+  CheckCUDAError("cublasCreate");
+  float alpha = 1, beta = 0;
+
+  float ms;
+  {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, M, N, K, &alpha, d_a->data(),
+                M, d_b->data(), N, &beta, d_c_mem, M);
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    CheckCUDAError("cublasSgemm");
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+  }
+
+  h_c->FromDevice(&d_c);
+  if (!h_c->Equal(h_c_ref)) {
+    puts("cublas invalid invocation");
+    exit(1);
+  }
+
+  cudaFree(d_c_mem);
+
+  printf("CUBLAS: %fms\n", ms);
+}
+
 int main(int argc, char **argv) {
   int max_active_blocks, max_blocks_per_mp, max_threads_per_mp, num_mp;
   float ms, occupancy;
@@ -310,6 +362,8 @@ int main(int argc, char **argv) {
   h_b.ToDevice(d_b);
 
   h_a.Mul(h_b, &h_c_ref);
+
+  CheckoutCublas();
 
   // Setup execution parameters
   dim3 block_size(BLOCK_SIZE, BLOCK_SIZE);
