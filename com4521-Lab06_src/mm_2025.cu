@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 
 #include <cuda/std/cstdint>
+#include <string>
 #include <vector>
 
 #include "common.cuh"
@@ -43,62 +44,87 @@ class MatrixWrapper {
 };
 
 template <typename T, typename M1, typename M2, typename M3>
-__global__ void MatrixMul(uint32_t block_size_m, uint32_t block_size_n,
-                          uint32_t block_size_k, uint32_t m, uint32_t n,
+__global__ void MatrixMul(uint32_t block_size_k, uint32_t m, uint32_t n,
                           uint32_t k, M1 d_a, M2 d_b, M3 d_c) {
-  extern __shared__ char shared[];
-  T *s_a_mem = (T *)shared;
-  T *s_b_mem = (T *)shared + block_size_m * block_size_k;
+  static constexpr uint32_t block_size_m = 64, block_size_n = 64;
 
-  auto s_a = MatrixWrapper<T, ColMajorLayout>{
-      s_a_mem, ColMajorLayout(block_size_m, block_size_k)};
-  auto s_b = MatrixWrapper<T, RowMajorLayout>{
-      s_b_mem, RowMajorLayout(block_size_k, block_size_n)};
+  extern __shared__ char shared[];
+  T *s_a_mem[2];
+  s_a_mem[0] = (T *)shared;
+  s_a_mem[1] = (T *)shared + block_size_m * block_size_k;
+  T *s_b_mem[2];
+  s_b_mem[0] = (T *)shared + 2 * block_size_m * block_size_k;
+  s_b_mem[1] = (T *)shared + 2 * block_size_m * block_size_k +
+               block_size_n * block_size_k;
+
+  MatrixWrapper<T, ColMajorLayout> s_a[2] = {
+      MatrixWrapper<T, ColMajorLayout>{
+          s_a_mem[0], ColMajorLayout(block_size_m, block_size_k)},
+      MatrixWrapper<T, ColMajorLayout>{
+          s_a_mem[1], ColMajorLayout(block_size_m, block_size_k)},
+  };
+  MatrixWrapper<T, RowMajorLayout> s_b[2] = {
+      MatrixWrapper<T, RowMajorLayout>{
+          s_b_mem[0], RowMajorLayout(block_size_k, block_size_n)},
+      MatrixWrapper<T, RowMajorLayout>{
+          s_b_mem[1], RowMajorLayout(block_size_k, block_size_n)},
+  };
 
   int lane_id = threadIdx.x % warpSize;
   int warp_id = threadIdx.x / warpSize;
   int num_warps = blockDim.x / warpSize;
+
+#define STORE(i, s_a, s_b)                                       \
+  do {                                                           \
+    _Pragma("unroll") for (int j = warp_id * warpSize + lane_id; \
+                           j < block_size_m * block_size_k;      \
+                           j += num_warps * warpSize) {          \
+      int x = j % block_size_m, y = j / block_size_m;            \
+      s_a.SetNoCheck(x, y, d_a.Get(offset_m + x, offset_k + y)); \
+    }                                                            \
+    _Pragma("unroll") for (int j = warp_id * warpSize + lane_id; \
+                           j < block_size_k * block_size_n;      \
+                           j += num_warps * warpSize) {          \
+      int x = j / block_size_n, y = j % block_size_n;            \
+      s_b.SetNoCheck(x, y, d_b.Get(offset_k + x, offset_n + y)); \
+    }                                                            \
+  } while (0)
+
+#define COMPUTE(s_a_mem, s_b_mem)                                      \
+  do {                                                                 \
+    for (int j = 0; j < block_size_k; j++) {                           \
+      float4 l_vec = *(float4 *)(s_a_mem + j * block_size_m + tx * 4); \
+      float4 r_vec = *(float4 *)(s_b_mem + j * block_size_n + ty * 4); \
+      T *l = (T *)&l_vec;                                              \
+      T *r = (T *)&r_vec;                                              \
+      _Pragma("unroll") for (int idx = 0; idx < 16; idx++) {           \
+        answers[idx] += l[idx % 4] * r[idx / 4];                       \
+      }                                                                \
+    }                                                                  \
+  } while (0)
+
+  // z-order
+  // chinese doc: https://zhuanlan.zhihu.com/p/690052715
   int tx = (warp_id / 2) * 4 + (lane_id % 8) / 2;
   int ty = (warp_id % 2) * 8 + (lane_id / 8) * 2 + lane_id % 2;
 
   int num_subs = (k + block_size_k - 1) / block_size_k;
-  int offset_m = block_size_m * blockIdx.x;
-  int offset_n = block_size_n * blockIdx.y;
 
   T answers[16] = {(T)0};
-  for (int i = 0; i < num_subs; i++) {
-    int offset_k = block_size_k * i;
 
-    // load into shared memory
-#pragma unroll
-    for (int j = warp_id * warpSize + lane_id; j < block_size_m * block_size_k;
-         j += num_warps * warpSize) {
-      int x = j % block_size_m, y = j / block_size_m;
-      s_a.SetNoCheck(x, y, d_a.Get(offset_m + x, offset_k + y));
-    }
-#pragma unroll
-    for (int j = warp_id * warpSize + lane_id; j < block_size_k * block_size_n;
-         j += num_warps * warpSize) {
-      int x = j / block_size_n, y = j % block_size_n;
-      s_b.SetNoCheck(x, y, d_b.Get(offset_k + x, offset_n + y));
-    }
-    __syncthreads();
+  int offset_m = block_size_m * blockIdx.x;
+  int offset_n = block_size_n * blockIdx.y;
+  int offset_k = 0;
 
-    // z-order
-    // chinese doc: https://zhuanlan.zhihu.com/p/690052715
-    for (int j = 0; j < block_size_k; j++) {
-      float4 l_vec = *(float4 *)(s_a_mem + j * block_size_m + tx * 4);
-      float4 r_vec = *(float4 *)(s_b_mem + j * block_size_n + ty * 4);
-      T *l = (T *)&l_vec;
-      T *r = (T *)&r_vec;
-#pragma unroll
-      for (int idx = 0; idx < 16; idx++) {
-        answers[idx] += l[idx % 4] * r[idx / 4];
-      }
-    }
-
+  STORE(0, s_a[0], s_b[0]);
+  __syncthreads();
+  for (int i = 1; i < num_subs; i++) {
+    offset_k = block_size_k * i;
+    STORE(0, s_a[i % 2], s_b[i % 2]);
+    COMPUTE(s_a_mem[(i - 1) % 2], s_b_mem[(i - 1) % 2]);
     __syncthreads();
   }
+  COMPUTE(s_a_mem[(num_subs - 1) % 2], s_b_mem[(num_subs - 1) % 2]);
 
 #pragma unroll
   for (int idx = 0; idx < 16; idx++) {
@@ -109,16 +135,15 @@ __global__ void MatrixMul(uint32_t block_size_m, uint32_t block_size_n,
 
 class Im2colLayout {
  public:
-  int batch_size, channels, height, width, kernel_height, kernel_width,
-      stride_height, stride_width, padding_height, padding_width;
+  int channels, height, width, kernel_height, kernel_width, stride_height,
+      stride_width, padding_height, padding_width;
   int output_height, output_width, matrix_height, matrix_width;
   __device__ __host__ Im2colLayout(int batch_size, int channels, int height,
                                    int width, int kernel_height,
                                    int kernel_width, int stride_height,
                                    int stride_width, int padding_height,
                                    int padding_width)
-      : batch_size(batch_size),
-        channels(channels),
+      : channels(channels),
         height(height),
         width(width),
         kernel_height(kernel_height),
@@ -158,15 +183,10 @@ class Im2colLayout {
 
 class WeightLayout {
  public:
-  int output_channels, input_channels, kernel_height, kernel_width;
   int matrix_height, matrix_width;
 
   __device__ __host__ WeightLayout(int output_channels, int input_channels,
-                                   int kernel_height, int kernel_width)
-      : output_channels(output_channels),
-        input_channels(input_channels),
-        kernel_height(kernel_height),
-        kernel_width(kernel_width) {
+                                   int kernel_height, int kernel_width) {
     matrix_height = input_channels * kernel_height * kernel_width;
     matrix_width = output_channels;
   }
@@ -179,14 +199,11 @@ class WeightLayout {
 
 class OutputLayout {
  public:
-  int batch_size, channels, height, width;
+  int channels, height, width;
   int matrix_height, matrix_width;
   __device__ __host__ OutputLayout(int batch_size, int channels, int height,
                                    int width)
-      : batch_size(batch_size),
-        channels(channels),
-        height(height),
-        width(width) {
+      : channels(channels), height(height), width(width) {
     matrix_height = batch_size * height * width;
     matrix_width = channels;
   }
@@ -231,11 +248,12 @@ float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
   dim3 block = {32 * num_warps, 1, 1};
   dim3 grid = {(m + block_size_m - 1) / block_size_m,
                (n + block_size_n - 1) / block_size_n, 1};
-  int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
+  int shared_bytes =
+      (block_size_m + block_size_n) * block_size_k * sizeof(T) * 2;
 
   float ms;
-  TIME("MatrixMul", ms, MatrixMul<T>, grid, block, shared_bytes, block_size_m,
-       block_size_n, block_size_k, m, n, k, a, b, c);
+  TIME("MatrixMul", ms, MatrixMul<T>, grid, block, shared_bytes, block_size_k,
+       m, n, k, a, b, c);
   return ms;
 }
 
@@ -341,7 +359,7 @@ struct BenchParams {
   int output_channels;
 };
 
-void Benchmark(const BenchParams &params) {
+void Benchmark(const BenchParams &params, int num_runs) {
   float *d_a, *d_b, *d_c;
 
   int output_height =
@@ -363,7 +381,6 @@ void Benchmark(const BenchParams &params) {
   auto h_b = Random(d_b, k * n);
 
   float total = 0;
-  int num_runs = 100;
   for (int i = 0; i < num_runs; i++) {
     total += ImplicitGEMM<float>(
         params.batch_size, params.input_channels, params.height, params.width,
@@ -377,13 +394,15 @@ void Benchmark(const BenchParams &params) {
                 (double)params.kernel_width;
   float ms = total / num_runs;
 
+  printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
+  printf("#runs = %d\n", num_runs);
+
   CheckCorrectness(params.batch_size, params.input_channels, params.height,
                    params.width, params.kernel_height, params.kernel_width,
                    params.stride_height, params.stride_width,
                    params.padding_height, params.padding_width,
                    params.output_channels, h_a, h_b, d_c);
 
-  printf("m = %d, n = %d, k = %d\n", m, n, k);
   printf("ImplicitGEMM: %.3fms\n", ms);
   printf("%.3f GFLOPs\n", flops * 1e3 / (float)(1 << 30) / ms);
 
@@ -392,15 +411,20 @@ void Benchmark(const BenchParams &params) {
   cudaFree(d_c);
 }
 
-int main() {
+int main(int argc, char **argv) {
   BenchParams suite[] = {
       BenchParams{64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128},
       BenchParams{64, 128, 14, 14, 3, 3, 1, 1, 1, 1, 128},
       BenchParams{64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32},
   };
 
-  for (auto params : suite) {
-    Benchmark(params);
+  if (argc >= 2) {
+    int p = std::stoi(argv[1]);
+    Benchmark(suite[p], 5);
+  } else {
+    for (auto params : suite) {
+      Benchmark(params, 100);
+    }
   }
   return 0;
 }
