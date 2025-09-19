@@ -17,11 +17,10 @@
 #include "common.cuh"
 
 constexpr uint32_t BLOCK_SIZE = 16;
-constexpr uint32_t A_HEIGHT =
-    (64 * 14 * 14 + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
-constexpr uint32_t A_WIDTH = 32 * 9;
-constexpr uint32_t B_HEIGHT = 32 * 9;
-constexpr uint32_t B_WIDTH = 128;
+constexpr uint32_t A_HEIGHT = 1024;
+constexpr uint32_t A_WIDTH = 1024;
+constexpr uint32_t B_HEIGHT = 1024;
+constexpr uint32_t B_WIDTH = 1024;
 #define C_HEIGHT A_HEIGHT
 #define C_WIDTH B_WIDTH
 
@@ -319,8 +318,9 @@ void CheckoutCublas() {
   CheckCUDAError("cublasCreate");
   float alpha = 1, beta = 0;
 
-  float ms;
-  {
+  float total_ms = 0;
+  int num_runs = 500;
+  for (int i = 0; i < num_runs; i++) {
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -330,9 +330,11 @@ void CheckoutCublas() {
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     CheckCUDAError("cublasSgemm");
+    float ms;
     cudaEventElapsedTime(&ms, start, stop);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+    total_ms += ms;
   }
 
   h_c->FromDevice(&d_c);
@@ -343,12 +345,13 @@ void CheckoutCublas() {
 
   cudaFree(d_c_mem);
 
+  float ms = total_ms / num_runs;
   printf("CUBLAS: %fms\n", ms);
 }
 
 int main(int argc, char **argv) {
   int max_active_blocks, max_blocks_per_mp, max_threads_per_mp, num_mp;
-  float ms, occupancy;
+  float occupancy;
 
   GetProperty(&max_blocks_per_mp, &max_threads_per_mp, &num_mp);
 
@@ -371,13 +374,20 @@ int main(int argc, char **argv) {
   dim3 block_size(BLOCK_SIZE, BLOCK_SIZE);
   dim3 grid_size(C_HEIGHT / BLOCK_SIZE, C_WIDTH / BLOCK_SIZE);
 
-  TIME("MatrixMulCUDA", ms, MatrixMulCUDA, grid_size, block_size, 0, d_a, d_b,
-       d_c);
-  LOG_RES("MatrixMulCUDA");
-
-  TIME("MatrixMulCUDASharedMemory", ms, MatrixMulCUDASharedMemory, grid_size,
-       block_size, 0, d_a, d_b, d_c);
-  LOG_RES("MatrixMulCUDASharedMemory");
+  {
+    CudaTimer timer;
+    MatrixMulCUDA<<<grid_size, block_size, 0>>>(d_a, d_b, d_c);
+    CheckCUDAError("MatrixMulCUDA");
+    float ms = timer.End();
+    LOG_RES("MatrixMulCUDA");
+  }
+  {
+    CudaTimer timer;
+    MatrixMulCUDASharedMemory<<<grid_size, block_size, 0>>>(d_a, d_b, d_c);
+    CheckCUDAError("MatrixMulCUDASharedMemory");
+    float ms = timer.End();
+    LOG_RES("MatrixMulCUDASharedMemory");
+  }
 
   // Compute the ocupancy
   occupancy = 1.0f * max_blocks_per_mp * (BLOCK_SIZE * BLOCK_SIZE) /

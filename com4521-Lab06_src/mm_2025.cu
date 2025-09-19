@@ -44,11 +44,10 @@ class MatrixWrapper {
   }
 };
 
-template <typename T, typename M1, typename M2, typename M3>
-__global__ void MatrixMul(uint32_t block_size_k, uint32_t m, uint32_t n,
-                          uint32_t k, M1 d_a, M2 d_b, M3 d_c) {
-  static constexpr uint32_t block_size_m = 64, block_size_n = 64;
-
+template <typename T, uint32_t block_size_m, uint32_t block_size_n,
+          uint32_t block_size_k, typename M1, typename M2, typename M3>
+__global__ void MatrixMul(uint32_t m, uint32_t n, uint32_t k, M1 d_a, M2 d_b,
+                          M3 d_c) {
   extern __shared__ char shared[];
   T *s_a_mem[2];
   s_a_mem[0] = (T *)shared;
@@ -57,6 +56,11 @@ __global__ void MatrixMul(uint32_t block_size_k, uint32_t m, uint32_t n,
   s_b_mem[0] = (T *)shared + 2 * block_size_m * block_size_k;
   s_b_mem[1] = (T *)shared + 2 * block_size_m * block_size_k +
                block_size_n * block_size_k;
+
+  static constexpr uint32_t num_warps = 8;
+  static constexpr uint32_t thread_tile = 16;
+  static constexpr uint32_t accum_regs_m = block_size_m / thread_tile;
+  static constexpr uint32_t accum_regs_n = block_size_n / thread_tile;
 
   MatrixWrapper<T, ColMajorLayout> s_a[2] = {
       MatrixWrapper<T, ColMajorLayout>{
@@ -73,7 +77,6 @@ __global__ void MatrixMul(uint32_t block_size_k, uint32_t m, uint32_t n,
 
   int lane_id = threadIdx.x % warpSize;
   int warp_id = threadIdx.x / warpSize;
-  int num_warps = blockDim.x / warpSize;
 
 #define STORE(i, s_a, s_b)                                       \
   do {                                                           \
@@ -82,22 +85,28 @@ __global__ void MatrixMul(uint32_t block_size_k, uint32_t m, uint32_t n,
                            j += num_warps * warpSize) {          \
       int x = j % block_size_m, y = j / block_size_m;            \
       s_a.SetNoCheck(x, y, d_a.Get(offset_m + x, offset_k + y)); \
-      x = j / block_size_n, y = j % block_size_n;                \
+    }                                                            \
+    _Pragma("unroll") for (int j = warp_id * warpSize + lane_id; \
+                           j < block_size_n * block_size_k;      \
+                           j += num_warps * warpSize) {          \
+      int x = j / block_size_n, y = j % block_size_n;            \
       s_b.SetNoCheck(x, y, d_b.Get(offset_k + x, offset_n + y)); \
     }                                                            \
   } while (0)
 
-#define COMPUTE(s_a_mem, s_b_mem)                                      \
-  do {                                                                 \
-    for (int j = 0; j < block_size_k; j++) {                           \
-      float4 l_vec = *(float4 *)(s_a_mem + j * block_size_m + tx * 4); \
-      float4 r_vec = *(float4 *)(s_b_mem + j * block_size_n + ty * 4); \
-      T *l = (T *)&l_vec;                                              \
-      T *r = (T *)&r_vec;                                              \
-      _Pragma("unroll") for (int idx = 0; idx < 16; idx++) {           \
-        answers[idx] += l[idx % 4] * r[idx / 4];                       \
-      }                                                                \
-    }                                                                  \
+#define COMPUTE(s_a_mem, s_b_mem)                                            \
+  do {                                                                       \
+    for (int j = 0; j < block_size_k; j++) {                                 \
+      T l[accum_regs_m], r[accum_regs_n];                                    \
+      _Pragma("unroll") for (int k = 0; k < accum_regs_m; k++) l[k] =        \
+          *(s_a_mem + j * block_size_m + tx * accum_regs_m + k);             \
+      _Pragma("unroll") for (int k = 0; k < accum_regs_n; k++) r[k] =        \
+          *(s_b_mem + j * block_size_m + ty * accum_regs_n + k);             \
+      _Pragma("unroll") for (int idx = 0; idx < accum_regs_m * accum_regs_n; \
+                             idx++) {                                        \
+        answers[idx] += l[idx % accum_regs_m] * r[idx / accum_regs_m];       \
+      }                                                                      \
+    }                                                                        \
   } while (0)
 
   // z-order
@@ -107,7 +116,7 @@ __global__ void MatrixMul(uint32_t block_size_k, uint32_t m, uint32_t n,
 
   int num_subs = (k + block_size_k - 1) / block_size_k;
 
-  T answers[16] = {(T)0};
+  T answers[accum_regs_m * accum_regs_n] = {(T)0};
 
   int offset_m = block_size_m * blockIdx.x;
   int offset_n = block_size_n * blockIdx.y;
@@ -122,8 +131,9 @@ __global__ void MatrixMul(uint32_t block_size_k, uint32_t m, uint32_t n,
   }
 
 #pragma unroll
-  for (int idx = 0; idx < 16; idx++) {
-    int x = offset_m + tx * 4 + idx % 4, y = offset_n + ty * 4 + idx / 4;
+  for (int idx = 0; idx < accum_regs_m * accum_regs_n; idx++) {
+    int x = offset_m + tx * accum_regs_m + idx % accum_regs_m;
+    int y = offset_n + ty * accum_regs_n + idx / accum_regs_m;
     d_c.Set(x, y, answers[idx]);
   }
 }
@@ -220,7 +230,8 @@ float GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
   MatrixWrapper<T, RowMajorLayout> b(weight, RowMajorLayout(k, n));
   MatrixWrapper<T, ColMajorLayout> c(output, ColMajorLayout(m, n));
 
-  uint32_t block_size_m = 64, block_size_n = 64, block_size_k = 4;
+  static constexpr uint32_t block_size_m = 64, block_size_n = 64,
+                            block_size_k = 4;
   uint32_t num_warps = 8;
   dim3 block = {32 * num_warps, 1, 1};
   dim3 grid = {(m + block_size_m - 1) / block_size_m,
@@ -228,10 +239,11 @@ float GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
   int shared_bytes =
       (block_size_m + block_size_n) * block_size_k * sizeof(T) * 2;
 
-  float ms;
-  TIME("MatrixMul", ms, MatrixMul<T>, grid, block, shared_bytes, block_size_k,
-       m, n, k, a, b, c);
-  return ms;
+  CudaTimer timer;
+  MatrixMul<T, block_size_m, block_size_n, block_size_k>
+      <<<grid, block, shared_bytes>>>(m, n, k, a, b, c);
+  CheckCUDAError("MatrixMul");
+  return timer.End();
 }
 
 template <typename T>
@@ -258,7 +270,8 @@ float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
   uint32_t m = batch_size * output_height * output_width;
   uint32_t n = output_channels;
   uint32_t k = input_channels * kernel_height * kernel_width;
-  uint32_t block_size_m = 64, block_size_n = 64, block_size_k = 4;
+  static constexpr uint32_t block_size_m = 128, block_size_n = 128,
+                            block_size_k = 8;
   uint32_t num_warps = 8;
   dim3 block = {32 * num_warps, 1, 1};
   dim3 grid = {(m + block_size_m - 1) / block_size_m,
@@ -266,10 +279,11 @@ float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
   int shared_bytes =
       (block_size_m + block_size_n) * block_size_k * sizeof(T) * 2;
 
-  float ms;
-  TIME("MatrixMul", ms, MatrixMul<T>, grid, block, shared_bytes, block_size_k,
-       m, n, k, a, b, c);
-  return ms;
+  CudaTimer timer;
+  MatrixMul<T, block_size_m, block_size_n, block_size_k>
+      <<<grid, block, shared_bytes>>>(m, n, k, a, b, c);
+  CheckCUDAError("MatrixMul");
+  return timer.End();
 }
 
 template <typename T>
@@ -485,7 +499,7 @@ struct BenchMatMulParams : public BenchParams {
 
 int main(int argc, char **argv) {
   auto suite = std::vector<BenchParams *>{
-      new BenchMatMulParams(512, 512, 512),
+      new BenchMatMulParams(1024, 1024, 1024),
       new BenchConvParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
       new BenchConvParams(64, 128, 14, 14, 3, 3, 1, 1, 1, 1, 128),
       new BenchConvParams(64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32),

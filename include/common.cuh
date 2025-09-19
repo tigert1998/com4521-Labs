@@ -3,20 +3,29 @@
 
 #include <cstdio>
 
-#define TIME(message, ms, func_name, grid_size, block_size, shared_bytes, ...) \
-  do {                                                                         \
-    cudaEvent_t start, stop;                                                   \
-    cudaEventCreate(&start);                                                   \
-    cudaEventCreate(&stop);                                                    \
-    cudaEventRecord(start, 0);                                                 \
-    func_name<<<grid_size, block_size, shared_bytes>>>(__VA_ARGS__);           \
-    cudaEventRecord(stop, 0);                                                  \
-    cudaEventSynchronize(stop);                                                \
-    CheckCUDAError(message);                                                   \
-    cudaEventElapsedTime(&ms, start, stop);                                    \
-    cudaEventDestroy(start);                                                   \
-    cudaEventDestroy(stop);                                                    \
-  } while (0)
+class CudaTimer {
+  cudaEvent_t start_, stop_;
+
+ public:
+  inline CudaTimer() {
+    cudaEventCreate(&start_);
+    cudaEventCreate(&stop_);
+    cudaEventRecord(start_, 0);
+  }
+
+  inline float End() {
+    cudaEventRecord(stop_, 0);
+    cudaEventSynchronize(stop_);
+    float ms;
+    cudaEventElapsedTime(&ms, start_, stop_);
+    return ms;
+  }
+
+  inline ~CudaTimer() {
+    cudaEventDestroy(start_);
+    cudaEventDestroy(stop_);
+  }
+};
 
 inline void CheckCUDAError(const char *msg) {
   cudaError_t err = cudaGetLastError();
