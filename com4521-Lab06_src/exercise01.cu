@@ -7,6 +7,7 @@
 #include <device_launch_parameters.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,14 +16,15 @@
 
 #include "common.cuh"
 
-#define A_HEIGHT 512
-#define A_WIDTH 1024
-#define B_HEIGHT 1024
-#define B_WIDTH 2048
+constexpr uint32_t BLOCK_SIZE = 16;
+constexpr uint32_t A_HEIGHT =
+    (64 * 14 * 14 + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+constexpr uint32_t A_WIDTH = 32 * 9;
+constexpr uint32_t B_HEIGHT = 32 * 9;
+constexpr uint32_t B_WIDTH = 128;
 #define C_HEIGHT A_HEIGHT
 #define C_WIDTH B_WIDTH
 
-#define BLOCK_SIZE 16
 #define NUM_SUBS (A_WIDTH / BLOCK_SIZE)
 
 static_assert(A_WIDTH == B_HEIGHT, "A_HEIGHT != B_WIDTH");
@@ -369,12 +371,12 @@ int main(int argc, char **argv) {
   dim3 block_size(BLOCK_SIZE, BLOCK_SIZE);
   dim3 grid_size(C_HEIGHT / BLOCK_SIZE, C_WIDTH / BLOCK_SIZE);
 
-  TIME("MatrixMulCUDA", ms, MatrixMulCUDA, grid_size, block_size, d_a, d_b,
+  TIME("MatrixMulCUDA", ms, MatrixMulCUDA, grid_size, block_size, 0, d_a, d_b,
        d_c);
   LOG_RES("MatrixMulCUDA");
 
   TIME("MatrixMulCUDASharedMemory", ms, MatrixMulCUDASharedMemory, grid_size,
-       block_size, d_a, d_b, d_c);
+       block_size, 0, d_a, d_b, d_c);
   LOG_RES("MatrixMulCUDASharedMemory");
 
   // Compute the ocupancy

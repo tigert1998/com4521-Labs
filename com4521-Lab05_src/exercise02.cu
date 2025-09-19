@@ -138,7 +138,7 @@ int main(void) {
     // generate a image from the sphere data
 
     TIME("kernel (normal)", timing_data.x, RayTraceNormal, blocksPerGrid,
-         threadsPerBlock, d_image, d_s);
+         threadsPerBlock, 0, d_image, d_s);
 
     cudaMemcpy(h_image, d_image, image_size, cudaMemcpyDeviceToHost);
     CheckCUDAError("CUDA memcpy from device");
@@ -146,7 +146,7 @@ int main(void) {
                                  std::to_string(sphere_count) + ".ppm");
 
     TIME("kernel (read only)", timing_data.y, RayTraceReadOnly, blocksPerGrid,
-         threadsPerBlock, d_image, d_s);
+         threadsPerBlock, 0, d_image, d_s);
 
     cudaMemcpy(h_image, d_image, image_size, cudaMemcpyDeviceToHost);
     CheckCUDAError("CUDA memcpy from device");
@@ -154,7 +154,7 @@ int main(void) {
                                  std::to_string(sphere_count) + ".ppm");
 
     TIME("kernel (constant)", timing_data.z, RayTraceConst, blocksPerGrid,
-         threadsPerBlock, d_image);
+         threadsPerBlock, 0, d_image);
 
     cudaMemcpy(h_image, d_image, image_size, cudaMemcpyDeviceToHost);
     CheckCUDAError("CUDA memcpy from device");

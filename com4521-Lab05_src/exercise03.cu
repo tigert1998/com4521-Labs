@@ -116,7 +116,7 @@ int main(void) {
   dim3 threadsPerBlock(16, 16);
 
   // normal version
-  TIME("kernel (normal)", ms.x, ImageBlur, blocksPerGrid, threadsPerBlock,
+  TIME("kernel (normal)", ms.x, ImageBlur, blocksPerGrid, threadsPerBlock, 0,
        d_image, d_image_output);
 
   // copy the image back from the GPU for output to file
@@ -125,7 +125,7 @@ int main(void) {
   OutputImageFile("normal.ppm", h_image);
 
   TIME("kernel (texture 1D)", ms.y, ImageBlurTexture1D, blocksPerGrid,
-       threadsPerBlock, d_image_output);
+       threadsPerBlock, 0, d_image_output);
 
   // copy the image back from the GPU for output to file
   cudaMemcpy(h_image, d_image_output, image_size, cudaMemcpyDeviceToHost);
@@ -133,7 +133,7 @@ int main(void) {
   OutputImageFile("tex_1d.ppm", h_image);
 
   TIME("kernel (texture 2D)", ms.z, ImageBlurTexture2D, blocksPerGrid,
-       threadsPerBlock, d_image_output);
+       threadsPerBlock, 0, d_image_output);
 
   // copy the image back from the GPU for output to file
   cudaMemcpy(h_image, d_image_output, image_size, cudaMemcpyDeviceToHost);
