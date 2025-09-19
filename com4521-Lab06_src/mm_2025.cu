@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 
 #include <cuda/std/cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -81,11 +82,7 @@ __global__ void MatrixMul(uint32_t block_size_k, uint32_t m, uint32_t n,
                            j += num_warps * warpSize) {          \
       int x = j % block_size_m, y = j / block_size_m;            \
       s_a.SetNoCheck(x, y, d_a.Get(offset_m + x, offset_k + y)); \
-    }                                                            \
-    _Pragma("unroll") for (int j = warp_id * warpSize + lane_id; \
-                           j < block_size_k * block_size_n;      \
-                           j += num_warps * warpSize) {          \
-      int x = j / block_size_n, y = j % block_size_n;            \
+      x = j / block_size_n, y = j % block_size_n;                \
       s_b.SetNoCheck(x, y, d_b.Get(offset_k + x, offset_n + y)); \
     }                                                            \
   } while (0)
@@ -116,15 +113,13 @@ __global__ void MatrixMul(uint32_t block_size_k, uint32_t m, uint32_t n,
   int offset_n = block_size_n * blockIdx.y;
   int offset_k = 0;
 
-  STORE(0, s_a[0], s_b[0]);
-  __syncthreads();
-  for (int i = 1; i < num_subs; i++) {
+  for (int i = 0; i < num_subs; i++) {
     offset_k = block_size_k * i;
-    STORE(0, s_a[i % 2], s_b[i % 2]);
-    COMPUTE(s_a_mem[(i - 1) % 2], s_b_mem[(i - 1) % 2]);
     __syncthreads();
+    STORE(i, s_a[0], s_b[0]);
+    __syncthreads();
+    COMPUTE(s_a_mem[0], s_b_mem[0]);
   }
-  COMPUTE(s_a_mem[(num_subs - 1) % 2], s_b_mem[(num_subs - 1) % 2]);
 
 #pragma unroll
   for (int idx = 0; idx < 16; idx++) {
@@ -220,6 +215,26 @@ class OutputLayout {
 };
 
 template <typename T>
+float GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
+  MatrixWrapper<T, ColMajorLayout> a(input, ColMajorLayout(m, k));
+  MatrixWrapper<T, RowMajorLayout> b(weight, RowMajorLayout(k, n));
+  MatrixWrapper<T, ColMajorLayout> c(output, ColMajorLayout(m, n));
+
+  uint32_t block_size_m = 64, block_size_n = 64, block_size_k = 4;
+  uint32_t num_warps = 8;
+  dim3 block = {32 * num_warps, 1, 1};
+  dim3 grid = {(m + block_size_m - 1) / block_size_m,
+               (n + block_size_n - 1) / block_size_n, 1};
+  int shared_bytes =
+      (block_size_m + block_size_n) * block_size_k * sizeof(T) * 2;
+
+  float ms;
+  TIME("MatrixMul", ms, MatrixMul<T>, grid, block, shared_bytes, block_size_k,
+       m, n, k, a, b, c);
+  return ms;
+}
+
+template <typename T>
 float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
                    int kernel_height, int kernel_width, int stride_height,
                    int stride_width, int padding_height, int padding_width,
@@ -236,9 +251,9 @@ float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
   WeightLayout weight_layout(output_channels, input_channels, kernel_height,
                              kernel_width);
   MatrixWrapper<T, WeightLayout> b(weight, weight_layout);
-  OutputLayout col2im_layout(batch_size, output_channels, output_height,
+  OutputLayout output_layout(batch_size, output_channels, output_height,
                              output_width);
-  MatrixWrapper<T, OutputLayout> c(output, col2im_layout);
+  MatrixWrapper<T, OutputLayout> c(output, output_layout);
 
   uint32_t m = batch_size * output_height * output_width;
   uint32_t n = output_channels;
@@ -334,8 +349,12 @@ void CheckCorrectness(int batch_size, int input_channels, int height, int width,
               co * output_height * output_width + ho * output_width + wo;
 
           if (abs(output[output_idx] - sum) >= 1e-3) {
-            printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
-                   output[output_idx], sum);
+            if (num_mismatches < 8) {
+              printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
+                     output[output_idx], sum);
+            } else if (num_mismatches == 8) {
+              printf("...\n");
+            }
             num_mismatches += 1;
           }
         }
@@ -346,6 +365,11 @@ void CheckCorrectness(int batch_size, int input_channels, int height, int width,
 }
 
 struct BenchParams {
+  virtual void Benchmark(int num_runs) = 0;
+  virtual ~BenchParams() {}
+};
+
+struct BenchConvParams : public BenchParams {
   int batch_size;
   int input_channels;
   int height;
@@ -357,74 +381,125 @@ struct BenchParams {
   int padding_height;
   int padding_width;
   int output_channels;
+
+  BenchConvParams(int batch_size, int input_channels, int height, int width,
+                  int kernel_height, int kernel_width, int stride_height,
+                  int stride_width, int padding_height, int padding_width,
+                  int output_channels)
+      : batch_size(batch_size),
+        input_channels(input_channels),
+        height(height),
+        width(width),
+        kernel_height(kernel_height),
+        kernel_width(kernel_width),
+        stride_height(stride_height),
+        stride_width(stride_width),
+        padding_height(padding_height),
+        padding_width(padding_width),
+        output_channels(output_channels) {}
+
+  ~BenchConvParams() override {}
+
+  void Benchmark(int num_runs) override {
+    float *d_a, *d_b, *d_c;
+
+    int output_height =
+        (height + 2 * padding_height - kernel_height) / stride_height + 1;
+    int output_width =
+        (width + 2 * padding_width - kernel_width) / stride_width + 1;
+    int m = batch_size * height * width;
+    int n = output_channels;
+    int k = input_channels * kernel_height * kernel_width;
+
+    cudaMalloc(&d_a, sizeof(float) * m * k);
+    cudaMalloc(&d_b, sizeof(float) * k * n);
+    cudaMalloc(&d_c, sizeof(float) * m * n);
+    auto h_a = Random(d_a, m * k);
+    auto h_b = Random(d_b, k * n);
+
+    float total = 0;
+    for (int i = 0; i < num_runs; i++) {
+      total += ImplicitGEMM<float>(batch_size, input_channels, height, width,
+                                   kernel_height, kernel_width, stride_height,
+                                   stride_width, padding_height, padding_width,
+                                   output_channels, d_a, d_b, d_c);
+    }
+    float flops = 2.0f * (double)batch_size * (double)output_height *
+                  (double)output_width * (double)output_channels *
+                  (double)input_channels * (double)kernel_height *
+                  (double)kernel_width;
+    float ms = total / num_runs;
+
+    printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
+    printf("#runs = %d\n", num_runs);
+
+    CheckCorrectness(batch_size, input_channels, height, width, kernel_height,
+                     kernel_width, stride_height, stride_width, padding_height,
+                     padding_width, output_channels, h_a, h_b, d_c);
+
+    printf("ImplicitGEMM Conv: %.3fms\n", ms);
+    printf("%.3f GFLOPs\n", flops * 1e3 / (float)(1 << 30) / ms);
+
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_c);
+  }
 };
 
-void Benchmark(const BenchParams &params, int num_runs) {
-  float *d_a, *d_b, *d_c;
+struct BenchMatMulParams : public BenchParams {
+  int m;
+  int n;
+  int k;
 
-  int output_height =
-      (params.height + 2 * params.padding_height - params.kernel_height) /
-          params.stride_height +
-      1;
-  int output_width =
-      (params.width + 2 * params.padding_width - params.kernel_width) /
-          params.stride_width +
-      1;
-  int m = params.batch_size * params.height * params.width;
-  int n = params.output_channels;
-  int k = params.input_channels * params.kernel_height * params.kernel_width;
+  BenchMatMulParams(int m, int n, int k) : m(m), n(n), k(k) {}
 
-  cudaMalloc(&d_a, sizeof(float) * m * k);
-  cudaMalloc(&d_b, sizeof(float) * k * n);
-  cudaMalloc(&d_c, sizeof(float) * m * n);
-  auto h_a = Random(d_a, m * k);
-  auto h_b = Random(d_b, k * n);
+  ~BenchMatMulParams() override {}
 
-  float total = 0;
-  for (int i = 0; i < num_runs; i++) {
-    total += ImplicitGEMM<float>(
-        params.batch_size, params.input_channels, params.height, params.width,
-        params.kernel_height, params.kernel_width, params.stride_height,
-        params.stride_width, params.padding_height, params.padding_width,
-        params.output_channels, d_a, d_b, d_c);
+  void Benchmark(int num_runs) override {
+    float *d_a, *d_b, *d_c;
+
+    cudaMalloc(&d_a, sizeof(float) * m * k);
+    cudaMalloc(&d_b, sizeof(float) * k * n);
+    cudaMalloc(&d_c, sizeof(float) * m * n);
+    auto h_a = Random(d_a, m * k);
+    auto h_b = Random(d_b, k * n);
+
+    float total = 0;
+    for (int i = 0; i < num_runs; i++) {
+      total += GEMM<float>(m, n, k, d_a, d_b, d_c);
+    }
+    float flops = 2.0f * (double)m * (double)n * (double)k;
+    float ms = total / num_runs;
+
+    printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
+    printf("#runs = %d\n", num_runs);
+
+    printf("ImplicitGEMM MatMul: %.3fms\n", ms);
+    printf("%.3f GFLOPs\n", flops * 1e3 / (float)(1 << 30) / ms);
+
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_c);
   }
-  float flops = 2.0f * (double)params.batch_size * (double)output_height *
-                (double)output_width * (double)params.output_channels *
-                (double)params.input_channels * (double)params.kernel_height *
-                (double)params.kernel_width;
-  float ms = total / num_runs;
-
-  printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
-  printf("#runs = %d\n", num_runs);
-
-  CheckCorrectness(params.batch_size, params.input_channels, params.height,
-                   params.width, params.kernel_height, params.kernel_width,
-                   params.stride_height, params.stride_width,
-                   params.padding_height, params.padding_width,
-                   params.output_channels, h_a, h_b, d_c);
-
-  printf("ImplicitGEMM: %.3fms\n", ms);
-  printf("%.3f GFLOPs\n", flops * 1e3 / (float)(1 << 30) / ms);
-
-  cudaFree(d_a);
-  cudaFree(d_b);
-  cudaFree(d_c);
-}
+};
 
 int main(int argc, char **argv) {
-  BenchParams suite[] = {
-      BenchParams{64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128},
-      BenchParams{64, 128, 14, 14, 3, 3, 1, 1, 1, 1, 128},
-      BenchParams{64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32},
+  auto suite = std::vector<BenchParams *>{
+      new BenchMatMulParams(512, 512, 512),
+      new BenchConvParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
+      new BenchConvParams(64, 128, 14, 14, 3, 3, 1, 1, 1, 1, 128),
+      new BenchConvParams(64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32),
   };
 
   if (argc >= 2) {
     int p = std::stoi(argv[1]);
-    Benchmark(suite[p], 5);
+    suite[p]->Benchmark(5);
   } else {
-    for (auto params : suite) {
-      Benchmark(params, 100);
+    for (int i = 0; i < suite.size(); i++) {
+      suite[i]->Benchmark(500);
     }
   }
+
+  for (int i = 0; i < suite.size(); i++) delete suite[i];
   return 0;
 }
