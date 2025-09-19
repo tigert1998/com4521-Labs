@@ -29,6 +29,9 @@ class MatrixWrapper {
   L layout;
   __device__ __host__ MatrixWrapper(T *ptr, L layout)
       : ptr(ptr), layout(layout) {}
+  __device__ __host__ void SetNoCheck(int x, int y, T value) {
+    ptr[layout.Index(x, y)] = value;
+  }
   __device__ __host__ void Set(int x, int y, T value) {
     int i = layout.Index(x, y);
     if (i >= 0) ptr[i] = value;
@@ -71,13 +74,13 @@ __global__ void MatrixMul(uint32_t block_size_m, uint32_t block_size_n,
     for (int j = warp_id * warpSize + lane_id; j < block_size_m * block_size_k;
          j += num_warps * warpSize) {
       int x = j % block_size_m, y = j / block_size_m;
-      s_a.Set(x, y, d_a.Get(offset_m + x, offset_k + y));
+      s_a.SetNoCheck(x, y, d_a.Get(offset_m + x, offset_k + y));
     }
 #pragma unroll
     for (int j = warp_id * warpSize + lane_id; j < block_size_k * block_size_n;
          j += num_warps * warpSize) {
       int x = j / block_size_n, y = j % block_size_n;
-      s_b.Set(x, y, d_b.Get(offset_k + x, offset_n + y));
+      s_b.SetNoCheck(x, y, d_b.Get(offset_k + x, offset_n + y));
     }
     __syncthreads();
 
@@ -93,6 +96,8 @@ __global__ void MatrixMul(uint32_t block_size_m, uint32_t block_size_n,
         answers[idx] += l[idx % 4] * r[idx / 4];
       }
     }
+
+    __syncthreads();
   }
 
 #pragma unroll
@@ -239,30 +244,117 @@ std::vector<T> Random(T *ptr, uint32_t size) {
   std::vector<T> v(size);
   for (int i = 0; i < size; i++) v[i] = rand() * 1.0 / RAND_MAX;
   cudaMemcpy(ptr, v.data(), size * sizeof(T), cudaMemcpyHostToDevice);
-  CheckCUDAError("cudaMemcpy");
+  CheckCUDAError("cudaMemcpy cudaMemcpyHostToDevice");
   return v;
 }
 
-int main() {
-  int batch_size = 64;
-  int input_channels = 32;
-  int height = 14;
-  int width = 14, int kernel_height = 3;
-  int kernel_width = 3;
-  int stride_height = 1;
-  int stride_width = 1;
-  int padding_height = 1;
-  int padding_width = 1;
-  int output_channels = 128;
-  float *d_a, *d_b, *d_c;
+void CheckZOrder() {
+  int mat[16][16];
+  for (int thread_idx = 0; thread_idx < 32 * 8; thread_idx++) {
+    int lane_id = thread_idx % 32;
+    int warp_id = thread_idx / 32;
+    int tx = (warp_id / 2) * 4 + (lane_id % 8) / 2;
+    int ty = (warp_id % 2) * 8 + (lane_id / 8) * 2 + lane_id % 2;
+    mat[tx][ty] = thread_idx;
+  }
+  for (int i = 0; i < 16; i++) {
+    for (int j = 0; j < 16; j++) printf("%4d ", mat[i][j]);
+    printf("\n");
+  }
+}
 
+template <typename T>
+void CheckCorrectness(int batch_size, int input_channels, int height, int width,
+                      int kernel_height, int kernel_width, int stride_height,
+                      int stride_width, int padding_height, int padding_width,
+                      int output_channels, const std::vector<T> &input,
+                      const std::vector<T> &weight, T *d_output) {
+  int num_mismatches = 0;
   int output_height =
       (height + 2 * padding_height - kernel_height) / stride_height + 1;
   int output_width =
       (width + 2 * padding_width - kernel_width) / stride_width + 1;
-  int m = batch_size * height * width;
-  int n = output_channels;
-  int k = input_channels * kernel_height * kernel_width;
+
+  std::vector<T> output(batch_size * output_channels * output_height *
+                        output_width);
+  cudaMemcpy(output.data(), d_output, output.size() * sizeof(T),
+             cudaMemcpyDeviceToHost);
+  CheckCUDAError("cudaMemcpy cudaMemcpyDeviceToHost");
+
+  for (int b = 0; b < batch_size; ++b) {
+    for (int co = 0; co < output_channels; ++co) {
+      for (int ho = 0; ho < output_height; ++ho) {
+        for (int wo = 0; wo < output_width; ++wo) {
+          T sum = 0;
+
+          int h_start = ho * stride_height - padding_height;
+          int w_start = wo * stride_width - padding_width;
+
+          for (int ci = 0; ci < input_channels; ++ci) {
+            for (int kh = 0; kh < kernel_height; ++kh) {
+              for (int kw = 0; kw < kernel_width; ++kw) {
+                int h = h_start + kh;
+                int w = w_start + kw;
+
+                if (h >= 0 && h < height && w >= 0 && w < width) {
+                  uint32_t input_idx = b * input_channels * height * width +
+                                       ci * height * width + h * width + w;
+
+                  uint32_t weight_idx =
+                      co * input_channels * kernel_height * kernel_width +
+                      ci * kernel_height * kernel_width + kh * kernel_width +
+                      kw;
+
+                  sum += input[input_idx] * weight[weight_idx];
+                }
+              }
+            }
+          }
+
+          uint32_t output_idx =
+              b * output_channels * output_height * output_width +
+              co * output_height * output_width + ho * output_width + wo;
+
+          if (abs(output[output_idx] - sum) >= 1e-3) {
+            printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
+                   output[output_idx], sum);
+            num_mismatches += 1;
+          }
+        }
+      }
+    }
+  }
+  printf("#mismatches: %d\n", num_mismatches);
+}
+
+struct BenchParams {
+  int batch_size;
+  int input_channels;
+  int height;
+  int width;
+  int kernel_height;
+  int kernel_width;
+  int stride_height;
+  int stride_width;
+  int padding_height;
+  int padding_width;
+  int output_channels;
+};
+
+void Benchmark(const BenchParams &params) {
+  float *d_a, *d_b, *d_c;
+
+  int output_height =
+      (params.height + 2 * params.padding_height - params.kernel_height) /
+          params.stride_height +
+      1;
+  int output_width =
+      (params.width + 2 * params.padding_width - params.kernel_width) /
+          params.stride_width +
+      1;
+  int m = params.batch_size * params.height * params.width;
+  int n = params.output_channels;
+  int k = params.input_channels * params.kernel_height * params.kernel_width;
 
   cudaMalloc(&d_a, sizeof(float) * m * k);
   cudaMalloc(&d_b, sizeof(float) * k * n);
@@ -273,14 +365,42 @@ int main() {
   float total = 0;
   int num_runs = 100;
   for (int i = 0; i < num_runs; i++) {
-    total += ImplicitGEMM<float>(batch_size, input_channels, height, width,
-                                 kernel_height, kernel_width, stride_height,
-                                 stride_width, padding_height, padding_width,
-                                 output_channels, d_a, d_b, d_c);
+    total += ImplicitGEMM<float>(
+        params.batch_size, params.input_channels, params.height, params.width,
+        params.kernel_height, params.kernel_width, params.stride_height,
+        params.stride_width, params.padding_height, params.padding_width,
+        params.output_channels, d_a, d_b, d_c);
   }
-  float flops = batch_size * output_height * output_width * output_channels *
-                input_channels * kernel_height * kernel_width * 2;
+  float flops = 2.0f * (double)params.batch_size * (double)output_height *
+                (double)output_width * (double)params.output_channels *
+                (double)params.input_channels * (double)params.kernel_height *
+                (double)params.kernel_width;
   float ms = total / num_runs;
+
+  CheckCorrectness(params.batch_size, params.input_channels, params.height,
+                   params.width, params.kernel_height, params.kernel_width,
+                   params.stride_height, params.stride_width,
+                   params.padding_height, params.padding_width,
+                   params.output_channels, h_a, h_b, d_c);
+
+  printf("m = %d, n = %d, k = %d\n", m, n, k);
   printf("ImplicitGEMM: %.3fms\n", ms);
-  printf("%.3f GFLOPs\n", flops * 1e3 / (1 << 30) / ms);
+  printf("%.3f GFLOPs\n", flops * 1e3 / (float)(1 << 30) / ms);
+
+  cudaFree(d_a);
+  cudaFree(d_b);
+  cudaFree(d_c);
+}
+
+int main() {
+  BenchParams suite[] = {
+      BenchParams{64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128},
+      BenchParams{64, 128, 14, 14, 3, 3, 1, 1, 1, 1, 128},
+      BenchParams{64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32},
+  };
+
+  for (auto params : suite) {
+    Benchmark(params);
+  }
+  return 0;
 }
