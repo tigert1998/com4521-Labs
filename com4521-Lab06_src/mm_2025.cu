@@ -45,70 +45,80 @@ class MatrixWrapper {
 };
 
 template <typename T, uint32_t block_size_m, uint32_t block_size_n,
-          uint32_t block_size_k, bool enable_smem_prefetch, typename M1,
-          typename M2, typename M3>
+          uint32_t block_size_k, typename M1, typename M2>
+__forceinline__ __device__ void StoreIntoSMEM(
+    int i, int warp_id, int lane_id, int num_warps, M1 d_a, M2 d_b,
+    MatrixWrapper<T, ColMajorLayout> s_a,
+    MatrixWrapper<T, RowMajorLayout> s_b) {
+  int offset_m = block_size_m * blockIdx.x;
+  int offset_n = block_size_n * blockIdx.y;
+
+#pragma unroll
+  for (int j = warp_id * warpSize + lane_id;
+       j < max(block_size_m, block_size_n) * block_size_k;
+       j += num_warps * warpSize) {
+    if (j < block_size_m * block_size_k) {
+      int x = j % block_size_m, y = j / block_size_m;
+      s_a.SetNoCheck(x, y, d_a.Get(offset_m + x, (block_size_k * (i)) + y));
+    }
+    if (j < block_size_n * block_size_k) {
+      int x = j / block_size_n, y = j % block_size_n;
+      s_b.SetNoCheck(x, y, d_b.Get((block_size_k * (i)) + x, offset_n + y));
+    }
+  }
+}
+
+template <typename T, uint32_t block_size_m, uint32_t block_size_n,
+          uint32_t thread_size_m, uint32_t thread_size_n>
+__forceinline__ __device__ void LoadFromSMEM(T *l, T *r, T *s_a_mem, T *s_b_mem,
+                                             int tx, int ty, int j) {
+#pragma unroll
+  for (int k = 0; k < thread_size_m; k++)
+    l[k] = *(s_a_mem + (j)*block_size_m + tx * thread_size_m + k);
+#pragma unroll
+  for (int k = 0; k < thread_size_n; k++)
+    r[k] = *(s_b_mem + (j)*block_size_n + ty * thread_size_n + k);
+}
+
+template <typename T, uint32_t block_size_m, uint32_t block_size_n,
+          uint32_t thread_size_m, uint32_t thread_size_n>
+__forceinline__ __device__ void ComputeRegisters(T *accum, T *l, T *r) {
+#pragma unroll
+  for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
+    accum[idx] += l[idx % thread_size_m] * r[idx / thread_size_m];
+  }
+}
+
+template <typename T, uint32_t block_size_m, uint32_t block_size_n,
+          uint32_t block_size_k, uint32_t thread_size_m, uint32_t thread_size_n>
+__forceinline__ __device__ void ComputePrefetch(T *accum, int tx, int ty,
+                                                T *s_a_mem, T *s_b_mem) {
+  T l[2][thread_size_m], r[2][thread_size_n];
+  LoadFromSMEM<T, block_size_m, block_size_n, thread_size_m, thread_size_n>(
+      l[0], r[0], s_a_mem, s_b_mem, tx, ty, 0);
+  for (int j = 0; j < block_size_k - 1; j++) {
+    LoadFromSMEM<T, block_size_m, block_size_n, thread_size_m, thread_size_n>(
+        l[(j + 1) % 2], r[(j + 1) % 2], s_a_mem, s_b_mem, tx, ty, j + 1);
+    ComputeRegisters<T, block_size_m, block_size_n, thread_size_m,
+                     thread_size_n>(accum, l[j % 2], r[j % 2]);
+  }
+  ComputeRegisters<T, block_size_m, block_size_n, thread_size_m, thread_size_n>(
+      accum, l[(block_size_k - 1) % 2], r[(block_size_k - 1) % 2]);
+}
+
+template <typename T, uint32_t block_size_m, uint32_t block_size_n,
+          uint32_t block_size_k, typename M1, typename M2, typename M3>
 __global__ void MatrixMul(uint32_t m, uint32_t n, uint32_t k, M1 d_a, M2 d_b,
                           M3 d_c) {
-  extern __shared__ char shared[];
-
-  static constexpr uint32_t num_warps = 8;
   static constexpr uint32_t thread_size_m = block_size_m / 16;
   static constexpr uint32_t thread_size_n = block_size_n / 16;
 
+  extern __shared__ char shared[];
+
+  static constexpr uint32_t num_warps = 8;
+
   int lane_id = threadIdx.x % warpSize;
   int warp_id = threadIdx.x / warpSize;
-
-#define STORE_SMEM(i, s_a, s_b)                                              \
-  do {                                                                       \
-    _Pragma("unroll") for (int j = warp_id * warpSize + lane_id;             \
-                           j < block_size_m * block_size_k;                  \
-                           j += num_warps * warpSize) {                      \
-      int x = j % block_size_m, y = j / block_size_m;                        \
-      s_a.SetNoCheck(x, y, d_a.Get(offset_m + x, (block_size_k * (i)) + y)); \
-    }                                                                        \
-    _Pragma("unroll") for (int j = warp_id * warpSize + lane_id;             \
-                           j < block_size_n * block_size_k;                  \
-                           j += num_warps * warpSize) {                      \
-      int x = j / block_size_n, y = j % block_size_n;                        \
-      s_b.SetNoCheck(x, y, d_b.Get((block_size_k * (i)) + x, offset_n + y)); \
-    }                                                                        \
-  } while (0)
-
-#define LOAD_SMEM(j, l, r, s_a_mem, s_b_mem)                         \
-  do {                                                               \
-    _Pragma("unroll") for (int k = 0; k < thread_size_m; k++) l[k] = \
-        *(s_a_mem + (j) * block_size_m + tx * thread_size_m + k);    \
-    _Pragma("unroll") for (int k = 0; k < thread_size_n; k++) r[k] = \
-        *(s_b_mem + (j) * block_size_n + ty * thread_size_n + k);    \
-  } while (0)
-
-#define COMPUTE_REGS(l, r)                                                   \
-  do {                                                                       \
-    _Pragma("unroll") for (int idx = 0; idx < thread_size_m * thread_size_n; \
-                           idx++) {                                          \
-      accum[idx] += l[idx % thread_size_m] * r[idx / thread_size_m];         \
-    }                                                                        \
-  } while (0)
-
-#define COMPUTE_PREFETCH(s_a_mem, s_b_mem)                                \
-  do {                                                                    \
-    T l[2][thread_size_m], r[2][thread_size_n];                           \
-    LOAD_SMEM(0, l[0], r[0], s_a_mem, s_b_mem);                           \
-    for (int j = 0; j < block_size_k - 1; j++) {                          \
-      LOAD_SMEM(j + 1, l[(j + 1) % 2], r[(j + 1) % 2], s_a_mem, s_b_mem); \
-      COMPUTE_REGS(l[j % 2], r[j % 2]);                                   \
-    }                                                                     \
-    COMPUTE_REGS(l[(block_size_k - 1) % 2], r[(block_size_k - 1) % 2]);   \
-  } while (0)
-
-#define COMPUTE_NO_PREFETCH(s_a_mem, s_b_mem) \
-  do {                                        \
-    T l[thread_size_m], r[thread_size_n];     \
-    for (int j = 0; j < block_size_k; j++) {  \
-      LOAD_SMEM(j, l, r, s_a_mem, s_b_mem);   \
-      COMPUTE_REGS(l, r);                     \
-    }                                         \
-  } while (0)
 
   // z-order
   // chinese doc: https://zhuanlan.zhihu.com/p/690052715
@@ -119,45 +129,23 @@ __global__ void MatrixMul(uint32_t m, uint32_t n, uint32_t k, M1 d_a, M2 d_b,
 
   T accum[thread_size_m * thread_size_n] = {(T)0};
 
-  int offset_m = block_size_m * blockIdx.x;
-  int offset_n = block_size_n * blockIdx.y;
-
-  if constexpr (enable_smem_prefetch) {
-    T *s_a_mem[2];
-    s_a_mem[0] = (T *)shared;
-    s_a_mem[1] = (T *)shared + block_size_m * block_size_k;
-    T *s_b_mem[2];
-    s_b_mem[0] = (T *)shared + 2 * block_size_m * block_size_k;
-    s_b_mem[1] = (T *)shared + 2 * block_size_m * block_size_k +
-                 block_size_n * block_size_k;
-    MatrixWrapper<T, ColMajorLayout> s_a[2] = {
-        MatrixWrapper<T, ColMajorLayout>{
-            s_a_mem[0], ColMajorLayout(block_size_m, block_size_k)},
-        MatrixWrapper<T, ColMajorLayout>{
-            s_a_mem[1], ColMajorLayout(block_size_m, block_size_k)},
-    };
-    MatrixWrapper<T, RowMajorLayout> s_b[2] = {
-        MatrixWrapper<T, RowMajorLayout>{
-            s_b_mem[0], RowMajorLayout(block_size_k, block_size_n)},
-        MatrixWrapper<T, RowMajorLayout>{
-            s_b_mem[1], RowMajorLayout(block_size_k, block_size_n)},
-    };
-    // TODO
-  } else {
-    T *s_a_mem = (T *)shared;
-    T *s_b_mem = (T *)shared + block_size_m * block_size_k;
-    auto s_a = MatrixWrapper<T, ColMajorLayout>{
-        s_a_mem, ColMajorLayout(block_size_m, block_size_k)};
-    auto s_b = MatrixWrapper<T, RowMajorLayout>{
-        s_b_mem, RowMajorLayout(block_size_k, block_size_n)};
-    for (int i = 0; i < num_subs; i++) {
-      __syncthreads();
-      STORE_SMEM(i, s_a, s_b);
-      __syncthreads();
-      COMPUTE_PREFETCH(s_a_mem, s_b_mem);
-    }
+  T *s_a_mem = (T *)shared;
+  T *s_b_mem = (T *)shared + block_size_m * block_size_k;
+  auto s_a = MatrixWrapper<T, ColMajorLayout>{
+      s_a_mem, ColMajorLayout(block_size_m, block_size_k)};
+  auto s_b = MatrixWrapper<T, RowMajorLayout>{
+      s_b_mem, RowMajorLayout(block_size_k, block_size_n)};
+  for (int i = 0; i < num_subs; i++) {
+    __syncthreads();
+    StoreIntoSMEM<T, block_size_m, block_size_n, block_size_k>(
+        i, warp_id, lane_id, num_warps, d_a, d_b, s_a, s_b);
+    __syncthreads();
+    ComputePrefetch<T, block_size_m, block_size_n, block_size_k, thread_size_m,
+                    thread_size_n>(accum, tx, ty, s_a_mem, s_b_mem);
   }
 
+  int offset_m = block_size_m * blockIdx.x;
+  int offset_n = block_size_n * blockIdx.y;
 #pragma unroll
   for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
     int x = offset_m + tx * thread_size_m + idx % thread_size_m;
@@ -260,17 +248,15 @@ float GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
 
   static constexpr uint32_t block_size_m = 64, block_size_n = 64,
                             block_size_k = 32;
-  static constexpr bool enable_smem_prefetch = false;
 
   uint32_t num_warps = 8;
   dim3 block = {32 * num_warps, 1, 1};
   dim3 grid = {(m + block_size_m - 1) / block_size_m,
                (n + block_size_n - 1) / block_size_n, 1};
-  int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T) *
-                     (enable_smem_prefetch ? 2 : 1);
+  int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
 
   CudaTimer timer;
-  MatrixMul<T, block_size_m, block_size_n, block_size_k, enable_smem_prefetch>
+  MatrixMul<T, block_size_m, block_size_n, block_size_k>
       <<<grid, block, shared_bytes>>>(m, n, k, a, b, c);
   CheckCUDAError("MatrixMul");
   return timer.End();
@@ -302,16 +288,14 @@ float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
   uint32_t k = input_channels * kernel_height * kernel_width;
   static constexpr uint32_t block_size_m = 64, block_size_n = 64,
                             block_size_k = 8;
-  static constexpr bool enable_smem_prefetch = false;
   uint32_t num_warps = 8;
   dim3 block = {32 * num_warps, 1, 1};
   dim3 grid = {(m + block_size_m - 1) / block_size_m,
                (n + block_size_n - 1) / block_size_n, 1};
-  int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T) *
-                     (enable_smem_prefetch ? 2 : 1);
+  int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
 
   CudaTimer timer;
-  MatrixMul<T, block_size_m, block_size_n, block_size_k, enable_smem_prefetch>
+  MatrixMul<T, block_size_m, block_size_n, block_size_k>
       <<<grid, block, shared_bytes>>>(m, n, k, a, b, c);
   CheckCUDAError("MatrixMul");
   return timer.End();
