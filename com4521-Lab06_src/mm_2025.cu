@@ -325,74 +325,6 @@ void CheckZOrder() {
   }
 }
 
-template <typename T>
-void CheckCorrectness(int batch_size, int input_channels, int height, int width,
-                      int kernel_height, int kernel_width, int stride_height,
-                      int stride_width, int padding_height, int padding_width,
-                      int output_channels, const std::vector<T> &input,
-                      const std::vector<T> &weight, T *d_output) {
-  int num_mismatches = 0;
-  int output_height =
-      (height + 2 * padding_height - kernel_height) / stride_height + 1;
-  int output_width =
-      (width + 2 * padding_width - kernel_width) / stride_width + 1;
-
-  std::vector<T> output(batch_size * output_channels * output_height *
-                        output_width);
-  cudaMemcpy(output.data(), d_output, output.size() * sizeof(T),
-             cudaMemcpyDeviceToHost);
-  CheckCUDAError("cudaMemcpy cudaMemcpyDeviceToHost");
-
-  for (int b = 0; b < batch_size; ++b) {
-    for (int co = 0; co < output_channels; ++co) {
-      for (int ho = 0; ho < output_height; ++ho) {
-        for (int wo = 0; wo < output_width; ++wo) {
-          T sum = 0;
-
-          int h_start = ho * stride_height - padding_height;
-          int w_start = wo * stride_width - padding_width;
-
-          for (int ci = 0; ci < input_channels; ++ci) {
-            for (int kh = 0; kh < kernel_height; ++kh) {
-              for (int kw = 0; kw < kernel_width; ++kw) {
-                int h = h_start + kh;
-                int w = w_start + kw;
-
-                if (h >= 0 && h < height && w >= 0 && w < width) {
-                  uint32_t input_idx = b * input_channels * height * width +
-                                       ci * height * width + h * width + w;
-
-                  uint32_t weight_idx =
-                      co * input_channels * kernel_height * kernel_width +
-                      ci * kernel_height * kernel_width + kh * kernel_width +
-                      kw;
-
-                  sum += input[input_idx] * weight[weight_idx];
-                }
-              }
-            }
-          }
-
-          uint32_t output_idx =
-              b * output_channels * output_height * output_width +
-              co * output_height * output_width + ho * output_width + wo;
-
-          if (abs(output[output_idx] - sum) >= 1e-3) {
-            if (num_mismatches < 8) {
-              printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
-                     output[output_idx], sum);
-            } else if (num_mismatches == 8) {
-              printf("...\n");
-            }
-            num_mismatches += 1;
-          }
-        }
-      }
-    }
-  }
-  printf("#mismatches: %d\n", num_mismatches);
-}
-
 struct BenchParams {
   virtual void Benchmark(int num_runs) = 0;
   virtual ~BenchParams() {}
@@ -429,6 +361,75 @@ struct BenchConvParams : public BenchParams {
 
   ~BenchConvParams() override {}
 
+  template <typename T>
+  void CheckCorrectness(int batch_size, int input_channels, int height,
+                        int width, int kernel_height, int kernel_width,
+                        int stride_height, int stride_width, int padding_height,
+                        int padding_width, int output_channels,
+                        const std::vector<T> &input,
+                        const std::vector<T> &weight, T *d_output) {
+    int num_mismatches = 0;
+    int output_height =
+        (height + 2 * padding_height - kernel_height) / stride_height + 1;
+    int output_width =
+        (width + 2 * padding_width - kernel_width) / stride_width + 1;
+
+    std::vector<T> output(batch_size * output_channels * output_height *
+                          output_width);
+    cudaMemcpy(output.data(), d_output, output.size() * sizeof(T),
+               cudaMemcpyDeviceToHost);
+    CheckCUDAError("cudaMemcpy cudaMemcpyDeviceToHost");
+
+    for (int b = 0; b < batch_size; ++b) {
+      for (int co = 0; co < output_channels; ++co) {
+        for (int ho = 0; ho < output_height; ++ho) {
+          for (int wo = 0; wo < output_width; ++wo) {
+            T sum = 0;
+
+            int h_start = ho * stride_height - padding_height;
+            int w_start = wo * stride_width - padding_width;
+
+            for (int ci = 0; ci < input_channels; ++ci) {
+              for (int kh = 0; kh < kernel_height; ++kh) {
+                for (int kw = 0; kw < kernel_width; ++kw) {
+                  int h = h_start + kh;
+                  int w = w_start + kw;
+
+                  if (h >= 0 && h < height && w >= 0 && w < width) {
+                    uint32_t input_idx = b * input_channels * height * width +
+                                         ci * height * width + h * width + w;
+
+                    uint32_t weight_idx =
+                        co * input_channels * kernel_height * kernel_width +
+                        ci * kernel_height * kernel_width + kh * kernel_width +
+                        kw;
+
+                    sum += input[input_idx] * weight[weight_idx];
+                  }
+                }
+              }
+            }
+
+            uint32_t output_idx =
+                b * output_channels * output_height * output_width +
+                co * output_height * output_width + ho * output_width + wo;
+
+            if (abs(output[output_idx] - sum) >= 1e-3) {
+              if (num_mismatches < 8) {
+                printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
+                       output[output_idx], sum);
+              } else if (num_mismatches == 8) {
+                printf("...\n");
+              }
+              num_mismatches += 1;
+            }
+          }
+        }
+      }
+    }
+    printf("#mismatches: %d\n", num_mismatches);
+  }
+
   void Benchmark(int num_runs) override {
     float *d_a, *d_b, *d_c;
 
@@ -462,9 +463,10 @@ struct BenchConvParams : public BenchParams {
     printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
     printf("#runs = %d\n", num_runs);
 
-    CheckCorrectness(batch_size, input_channels, height, width, kernel_height,
-                     kernel_width, stride_height, stride_width, padding_height,
-                     padding_width, output_channels, h_a, h_b, d_c);
+    CheckCorrectness<float>(batch_size, input_channels, height, width,
+                            kernel_height, kernel_width, stride_height,
+                            stride_width, padding_height, padding_width,
+                            output_channels, h_a, h_b, d_c);
 
     printf("ImplicitGEMM Conv: %.3fms\n", ms);
     printf("%.3f GFLOPs\n\n", flops * 1e3 / (float)(1 << 30) / ms);
@@ -484,6 +486,37 @@ struct BenchMatMulParams : public BenchParams {
 
   ~BenchMatMulParams() override {}
 
+  template <typename T>
+  void CheckCorrectness(const std::vector<T> &h_a, const std::vector<T> &h_b,
+                        T *d_c) {
+    int num_mismatches = 0;
+
+    std::vector<T> output(m * n);
+    cudaMemcpy(output.data(), d_c, output.size() * sizeof(T),
+               cudaMemcpyDeviceToHost);
+    CheckCUDAError("cudaMemcpy cudaMemcpyDeviceToHost");
+
+    for (int i = 0; i < m; i++)
+      for (int j = 0; j < n; j++) {
+        T sum = 0;
+        for (int iter = 0; iter < k; iter++) {
+          sum += h_a[iter * m + i] * h_b[iter * n + j];
+        }
+
+        int output_idx = j * m + i;
+        if (abs(output[output_idx] - sum) >= 1e-3) {
+          if (num_mismatches < 8) {
+            printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
+                   output[output_idx], sum);
+          } else if (num_mismatches == 8) {
+            printf("...\n");
+          }
+        }
+      }
+
+    printf("#mismatches: %d\n", num_mismatches);
+  }
+
   void Benchmark(int num_runs) override {
     float *d_a, *d_b, *d_c;
 
@@ -501,6 +534,7 @@ struct BenchMatMulParams : public BenchParams {
     float ms = total / num_runs;
 
     printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
+    CheckCorrectness<float>(h_a, h_b, d_c);
     printf("#runs = %d\n", num_runs);
 
     printf("ImplicitGEMM MatMul: %.3fms\n", ms);
