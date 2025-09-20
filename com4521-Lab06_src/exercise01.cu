@@ -346,7 +346,9 @@ void CheckoutCublas() {
   cudaFree(d_c_mem);
 
   float ms = total_ms / num_runs;
-  printf("CUBLAS: %fms\n", ms);
+  float flops = 2.0f * M * N * K;
+  printf("CUBLAS: %.3ffms\n", ms);
+  printf("CUBLAS: %.3f GFLOPs\n", flops * 1e3 / (1 << 30) / ms);
 }
 
 int main(int argc, char **argv) {
