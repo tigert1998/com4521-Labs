@@ -414,10 +414,10 @@ struct BenchConvParams : public BenchParams {
                 b * output_channels * output_height * output_width +
                 co * output_height * output_width + ho * output_width + wo;
 
-            if (abs(output[output_idx] - sum) >= 1e-3) {
+            if (abs((float)(output[output_idx] - sum)) >= 1e-3) {
               if (num_mismatches < 8) {
                 printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
-                       output[output_idx], sum);
+                       (float)output[output_idx], (float)sum);
               } else if (num_mismatches == 8) {
                 printf("...\n");
               }
@@ -454,10 +454,9 @@ struct BenchConvParams : public BenchParams {
                                    stride_width, padding_height, padding_width,
                                    output_channels, d_a, d_b, d_c);
     }
-    float flops = 2.0f * (double)batch_size * (double)output_height *
-                  (double)output_width * (double)output_channels *
-                  (double)input_channels * (double)kernel_height *
-                  (double)kernel_width;
+    float flops = 2.0f * batch_size * output_height * output_width *
+                  output_channels * input_channels * kernel_height *
+                  kernel_width;
     float ms = total / num_runs;
 
     printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
