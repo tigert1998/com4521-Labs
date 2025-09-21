@@ -109,7 +109,7 @@ __forceinline__ __device__ void ComputePrefetch(T *accum, int tx, int ty,
 template <typename T, uint32_t block_size_m, uint32_t block_size_n,
           uint32_t block_size_k, typename M1, typename M2, typename M3>
 __global__ void MatrixMul(uint32_t m, uint32_t n, uint32_t k, M1 d_a, M2 d_b,
-                          M3 d_c) {
+                          M3 d_c, T *bias) {
   static constexpr uint32_t thread_size_m = block_size_m / 16;
   static constexpr uint32_t thread_size_n = block_size_n / 16;
 
@@ -150,7 +150,7 @@ __global__ void MatrixMul(uint32_t m, uint32_t n, uint32_t k, M1 d_a, M2 d_b,
   for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
     int x = offset_m + tx * thread_size_m + idx % thread_size_m;
     int y = offset_n + ty * thread_size_n + idx / thread_size_m;
-    d_c.Set(x, y, accum[idx]);
+    d_c.Set(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
   }
 }
 
@@ -257,7 +257,7 @@ float GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
 
   CudaTimer timer;
   MatrixMul<T, block_size_m, block_size_n, block_size_k>
-      <<<grid, block, shared_bytes>>>(m, n, k, a, b, c);
+      <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, nullptr);
   CheckCUDAError("MatrixMul");
   return timer.End();
 }
@@ -266,7 +266,8 @@ template <typename T>
 float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
                    int kernel_height, int kernel_width, int stride_height,
                    int stride_width, int padding_height, int padding_width,
-                   int output_channels, T *input, T *weight, T *output) {
+                   int output_channels, T *input, T *weight, T *bias,
+                   T *output) {
   int output_height =
       (height + 2 * padding_height - kernel_height) / stride_height + 1;
   int output_width =
@@ -296,7 +297,7 @@ float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
 
   CudaTimer timer;
   MatrixMul<T, block_size_m, block_size_n, block_size_k>
-      <<<grid, block, shared_bytes>>>(m, n, k, a, b, c);
+      <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, bias);
   CheckCUDAError("MatrixMul");
   return timer.End();
 }
@@ -304,7 +305,7 @@ float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
 template <typename T>
 std::vector<T> Random(T *ptr, uint32_t size) {
   std::vector<T> v(size);
-  for (int i = 0; i < size; i++) v[i] = rand() * 1.0 / RAND_MAX;
+  for (int i = 0; i < size; i++) v[i] = rand() * 1.0 / RAND_MAX - 0.5;
   cudaMemcpy(ptr, v.data(), size * sizeof(T), cudaMemcpyHostToDevice);
   CheckCUDAError("cudaMemcpy cudaMemcpyHostToDevice");
   return v;
@@ -367,7 +368,8 @@ struct BenchConvParams : public BenchParams {
                         int stride_height, int stride_width, int padding_height,
                         int padding_width, int output_channels,
                         const std::vector<T> &input,
-                        const std::vector<T> &weight, T *d_output) {
+                        const std::vector<T> &weight,
+                        const std::vector<T> &bias, T *d_output) {
     int num_mismatches = 0;
     int output_height =
         (height + 2 * padding_height - kernel_height) / stride_height + 1;
@@ -384,7 +386,7 @@ struct BenchConvParams : public BenchParams {
       for (int co = 0; co < output_channels; ++co) {
         for (int ho = 0; ho < output_height; ++ho) {
           for (int wo = 0; wo < output_width; ++wo) {
-            T sum = 0;
+            T sum = bias[co];
 
             int h_start = ho * stride_height - padding_height;
             int w_start = wo * stride_width - padding_width;
@@ -431,7 +433,7 @@ struct BenchConvParams : public BenchParams {
   }
 
   void Benchmark(int num_runs) override {
-    float *d_a, *d_b, *d_c;
+    float *d_a, *d_b, *d_bias, *d_c;
 
     int output_height =
         (height + 2 * padding_height - kernel_height) / stride_height + 1;
@@ -443,16 +445,18 @@ struct BenchConvParams : public BenchParams {
 
     cudaMalloc(&d_a, sizeof(float) * m * k);
     cudaMalloc(&d_b, sizeof(float) * k * n);
+    cudaMalloc(&d_bias, sizeof(float) * n);
     cudaMalloc(&d_c, sizeof(float) * m * n);
     auto h_a = Random(d_a, m * k);
     auto h_b = Random(d_b, k * n);
+    auto h_bias = Random(d_bias, n);
 
     float total = 0;
     for (int i = 0; i < num_runs; i++) {
       total += ImplicitGEMM<float>(batch_size, input_channels, height, width,
                                    kernel_height, kernel_width, stride_height,
                                    stride_width, padding_height, padding_width,
-                                   output_channels, d_a, d_b, d_c);
+                                   output_channels, d_a, d_b, d_bias, d_c);
     }
     float flops = 2.0f * batch_size * output_height * output_width *
                   output_channels * input_channels * kernel_height *
@@ -465,7 +469,7 @@ struct BenchConvParams : public BenchParams {
     CheckCorrectness<float>(batch_size, input_channels, height, width,
                             kernel_height, kernel_width, stride_height,
                             stride_width, padding_height, padding_width,
-                            output_channels, h_a, h_b, d_c);
+                            output_channels, h_a, h_b, h_bias, d_c);
 
     printf("ImplicitGEMM Conv: %.3fms\n", ms);
     printf("%.3f GFLOPs\n\n", flops * 1e3 / (float)(1 << 30) / ms);
