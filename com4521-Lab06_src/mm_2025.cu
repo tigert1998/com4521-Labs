@@ -38,6 +38,10 @@ class MatrixWrapper {
     int i = layout.Index(x, y);
     if (i >= 0) ptr[i] = value;
   }
+  __device__ __host__ void Add(int x, int y, T value) {
+    int i = layout.Index(x, y);
+    if (i >= 0) atomicAdd(ptr + i, value);
+  }
   __device__ __host__ T Get(int x, int y) {
     int i = layout.Index(x, y);
     return i < 0 ? (T)0 : ptr[i];
@@ -146,11 +150,21 @@ __global__ void MatrixMul(uint32_t m, uint32_t n, uint32_t k, M1 d_a, M2 d_b,
 
   int offset_m = block_size_m * blockIdx.x;
   int offset_n = block_size_n * blockIdx.y;
+
 #pragma unroll
   for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
     int x = offset_m + tx * thread_size_m + idx % thread_size_m;
     int y = offset_n + ty * thread_size_n + idx / thread_size_m;
-    d_c.Set(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
+    d_c.Set(x, y, (T)0);
+  }
+
+  __syncthreads();
+
+#pragma unroll
+  for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
+    int x = offset_m + tx * thread_size_m + idx % thread_size_m;
+    int y = offset_n + ty * thread_size_n + idx / thread_size_m;
+    d_c.Add(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
   }
 }
 
@@ -292,11 +306,12 @@ float GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
 }
 
 template <typename T>
-float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
-                   int kernel_height, int kernel_width, int stride_height,
-                   int stride_width, int padding_height, int padding_width,
-                   int output_channels, T *input, T *weight, T *bias,
-                   T *output) {
+float ConvForwardImplicitGEMM(int batch_size, int input_channels, int height,
+                              int width, int kernel_height, int kernel_width,
+                              int stride_height, int stride_width,
+                              int padding_height, int padding_width,
+                              int output_channels, T *input, T *weight, T *bias,
+                              T *output) {
   int output_height =
       (height + 2 * padding_height - kernel_height) / stride_height + 1;
   int output_width =
@@ -329,6 +344,69 @@ float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
       <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, bias);
   CheckCUDAError("MatrixMul");
   return timer.End();
+}
+
+template <typename T>
+float ConvBackwardImplicitGEMM(int batch_size, int input_channels, int height,
+                               int width, int kernel_height, int kernel_width,
+                               int stride_height, int stride_width,
+                               int padding_height, int padding_width,
+                               int output_channels, T *input, T *weight,
+                               T *output_grad, T *input_grad, T *weight_grad) {
+  static constexpr uint32_t block_size_m = 64, block_size_n = 64,
+                            block_size_k = 8;
+  static constexpr int shared_bytes =
+      (block_size_m + block_size_n) * block_size_k * sizeof(T);
+  static constexpr uint32_t num_warps = 8;
+
+  int output_height =
+      (height + 2 * padding_height - kernel_height) / stride_height + 1;
+  int output_width =
+      (width + 2 * padding_width - kernel_width) / stride_width + 1;
+
+  // tensors
+  OutputLayout output_layout(batch_size, output_channels, output_height,
+                             output_width);
+  MatrixWrapper<T, OutputLayout> c(output, output_layout);
+  WeightLayout weight_layout(output_channels, input_channels, kernel_height,
+                             kernel_width, true);
+  MatrixWrapper<T, WeightLayout> b(weight, weight_layout);
+  Im2colLayout im2col_layout(batch_size, input_channels, height, width,
+                             kernel_height, kernel_width, stride_height,
+                             stride_width, padding_height, padding_width, true);
+  MatrixWrapper<T, Im2colLayout> a(input, im2col_layout);
+
+  // grads
+  Im2colLayout input_grad_layout(
+      batch_size, input_channels, height, width, kernel_height, kernel_width,
+      stride_height, stride_width, padding_height, padding_width, false);
+  MatrixWrapper<T, Im2colLayout> input_grad_matrix(input_grad,
+                                                   input_grad_layout);
+  WeightLayout weight_grad_layout(output_channels, input_channels,
+                                  kernel_height, kernel_width, false);
+  MatrixWrapper<T, WeightLayout> weight_grad_matrix(weight_grad,
+                                                    weight_grad_layout);
+
+  // calculation
+  uint32_t m = input_grad_matrix.layout.matrix_height;
+  uint32_t n = input_grad_matrix.layout.matrix_width;
+  uint32_t k = c.layout.matrix_width;
+  dim3 block = {32 * num_warps, 1, 1};
+  dim3 grid = {(m + block_size_m - 1) / block_size_m,
+               (n + block_size_n - 1) / block_size_n, 1};
+  MatrixMul<T, block_size_m, block_size_n, block_size_k>
+      <<<grid, block, shared_bytes>>>(m, n, k, c, b, input_grad_matrix,
+                                      nullptr);
+
+  m = weight_grad_matrix.layout.matrix_height;
+  n = weight_grad_matrix.layout.matrix_width;
+  k = a.layout.matrix_width;
+  block = {32 * num_warps, 1, 1};
+  grid = {(m + block_size_m - 1) / block_size_m,
+          (n + block_size_n - 1) / block_size_n, 1};
+  MatrixMul<T, block_size_m, block_size_n, block_size_k>
+      <<<grid, block, shared_bytes>>>(m, n, k, a, c, weight_grad_matrix,
+                                      nullptr);
 }
 
 template <typename T>
@@ -482,10 +560,10 @@ struct BenchConvParams : public BenchParams {
 
     float total = 0;
     for (int i = 0; i < num_runs; i++) {
-      total += ImplicitGEMM<float>(batch_size, input_channels, height, width,
-                                   kernel_height, kernel_width, stride_height,
-                                   stride_width, padding_height, padding_width,
-                                   output_channels, d_a, d_b, d_bias, d_c);
+      total += ConvForwardImplicitGEMM<float>(
+          batch_size, input_channels, height, width, kernel_height,
+          kernel_width, stride_height, stride_width, padding_height,
+          padding_width, output_channels, d_a, d_b, d_bias, d_c);
     }
     float flops = 2.0f * batch_size * output_height * output_width *
                   output_channels * input_channels * kernel_height *
@@ -500,7 +578,7 @@ struct BenchConvParams : public BenchParams {
                             stride_width, padding_height, padding_width,
                             output_channels, h_a, h_b, h_bias, d_c);
 
-    printf("ImplicitGEMM Conv: %.3fms\n", ms);
+    printf("ConvForwardImplicitGEMM Conv: %.3fms\n", ms);
     printf("%.3f GFLOPs\n\n", flops * 1e3 / (float)(1 << 30) / ms);
 
     cudaFree(d_a);
@@ -570,7 +648,7 @@ struct BenchMatMulParams : public BenchParams {
     CheckCorrectness<float>(h_a, h_b, d_c);
     printf("#runs = %d\n", num_runs);
 
-    printf("ImplicitGEMM MatMul: %.3fms\n", ms);
+    printf("ConvForwardImplicitGEMM MatMul: %.3fms\n", ms);
     printf("%.3f GFLOPs\n\n", flops * 1e3 / (float)(1 << 30) / ms);
 
     cudaFree(d_a);
