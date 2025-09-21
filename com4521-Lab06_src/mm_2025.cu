@@ -159,11 +159,12 @@ class Im2colLayout {
   int channels, height, width, kernel_height, kernel_width, stride_height,
       stride_width, padding_height, padding_width;
   int output_height, output_width, matrix_height, matrix_width;
+  bool t;
   __device__ __host__ Im2colLayout(int batch_size, int channels, int height,
                                    int width, int kernel_height,
                                    int kernel_width, int stride_height,
                                    int stride_width, int padding_height,
-                                   int padding_width)
+                                   int padding_width, bool t)
       : channels(channels),
         height(height),
         width(width),
@@ -172,24 +173,41 @@ class Im2colLayout {
         stride_height(stride_height),
         stride_width(stride_width),
         padding_height(padding_height),
-        padding_width(padding_width) {
+        padding_width(padding_width),
+        t(t) {
     output_height =
         (height + 2 * padding_height - kernel_height) / stride_height + 1;
     output_width =
         (width + 2 * padding_width - kernel_width) / stride_width + 1;
-    matrix_height = batch_size * output_height * output_width;
-    matrix_width = channels * kernel_height * kernel_width;
+
+    if (t) {
+      matrix_height = channels * kernel_height * kernel_width;
+      matrix_width = batch_size * output_height * output_width;
+    } else {
+      matrix_height = batch_size * output_height * output_width;
+      matrix_width = channels * kernel_height * kernel_width;
+    }
   }
 
   __device__ __host__ int Index(int x, int y) {
     if (x < 0 || x >= matrix_height || y < 0 || y >= matrix_width) return -1;
 
-    int batch_idx = x / (output_height * output_width);
-    int output_x = x / output_width % output_height;
-    int output_y = x % output_width;
-    int channel_idx = y / (kernel_height * kernel_width);
-    int kernel_x = y / kernel_width % kernel_height;
-    int kernel_y = y % kernel_width;
+    int batch_idx, output_x, output_y, channel_idx, kernel_x, kernel_y;
+    if (t) {
+      batch_idx = y / (output_height * output_width);
+      output_x = y / output_width % output_height;
+      output_y = y % output_width;
+      channel_idx = x / (kernel_height * kernel_width);
+      kernel_x = x / kernel_width % kernel_height;
+      kernel_y = x % kernel_width;
+    } else {
+      batch_idx = x / (output_height * output_width);
+      output_x = x / output_width % output_height;
+      output_y = x % output_width;
+      channel_idx = y / (kernel_height * kernel_width);
+      kernel_x = y / kernel_width % kernel_height;
+      kernel_y = y % kernel_width;
+    };
 
     int input_x = output_x * stride_height - padding_height + kernel_x;
     int input_y = output_y * stride_width - padding_width + kernel_y;
@@ -205,16 +223,27 @@ class Im2colLayout {
 class WeightLayout {
  public:
   int matrix_height, matrix_width;
+  bool t;
 
   __device__ __host__ WeightLayout(int output_channels, int input_channels,
-                                   int kernel_height, int kernel_width) {
-    matrix_height = input_channels * kernel_height * kernel_width;
-    matrix_width = output_channels;
+                                   int kernel_height, int kernel_width, bool t)
+      : t(t) {
+    if (t) {
+      matrix_height = output_channels;
+      matrix_width = input_channels * kernel_height * kernel_width;
+    } else {
+      matrix_height = input_channels * kernel_height * kernel_width;
+      matrix_width = output_channels;
+    }
   }
 
   __device__ __host__ int Index(int x, int y) {
     if (x < 0 || x >= matrix_height || y < 0 || y >= matrix_width) return -1;
-    return y * matrix_height + x;
+    if (t) {
+      return x * matrix_width + y;
+    } else {
+      return y * matrix_height + x;
+    }
   }
 };
 
@@ -273,12 +302,12 @@ float ImplicitGEMM(int batch_size, int input_channels, int height, int width,
   int output_width =
       (width + 2 * padding_width - kernel_width) / stride_width + 1;
 
-  Im2colLayout im2col_layout(batch_size, input_channels, height, width,
-                             kernel_height, kernel_width, stride_height,
-                             stride_width, padding_height, padding_width);
+  Im2colLayout im2col_layout(
+      batch_size, input_channels, height, width, kernel_height, kernel_width,
+      stride_height, stride_width, padding_height, padding_width, false);
   MatrixWrapper<T, Im2colLayout> a(input, im2col_layout);
   WeightLayout weight_layout(output_channels, input_channels, kernel_height,
-                             kernel_width);
+                             kernel_width, false);
   MatrixWrapper<T, WeightLayout> b(weight, weight_layout);
   OutputLayout output_layout(batch_size, output_channels, output_height,
                              output_width);
@@ -477,6 +506,7 @@ struct BenchConvParams : public BenchParams {
     cudaFree(d_a);
     cudaFree(d_b);
     cudaFree(d_c);
+    cudaFree(d_bias);
   }
 };
 
