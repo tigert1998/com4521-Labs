@@ -298,43 +298,23 @@ __global__ void MatrixMulGeneral(uint32_t m, uint32_t n, uint32_t k, M1 d_a,
   }
 }
 
-template <typename T, uint32_t R, typename M1, typename M2, typename M3>
+template <typename T, uint32_t block_size, typename M1, typename M2,
+          typename M3>
 __global__ void MatrixMulTallAndSkinny(uint32_t m, uint32_t n, uint32_t k,
                                        M1 d_a, M2 d_b, M3 d_c, T *bias) {
-  extern __shared__ char shared[];
-  T *sh_sum = (T *)shared;
-  int stride = blockDim.x * gridDim.x;
+  for (int i = blockIdx.x; i < m; i += gridDim.x) {
+    for (int j = blockIdx.y; j < n; j += gridDim.y) {
+      T thread_sum = 0.0;
 
-  T local_sum[R] = {(T)0};
-  for (int p = threadIdx.x + blockIdx.x * blockDim.x; p < k; p += stride) {
-    for (int i = 0; i < m; i++) {
-      for (int j = 0; j < n; j++) {
-        local_sum[i * n + j] += d_a.Get(i, p) * d_b.Get(p, j);
+      for (int idx = threadIdx.x; idx < k; idx += block_size) {
+        thread_sum += d_a.Get(i, idx) * d_b.Get(idx, j);
       }
-    }
-  }
 
-  int tid = threadIdx.x;
-  if (tid == 0) {
-    for (int i = 0; i < m; i++) {
-      for (int j = 0; j < n; j++) {
-        sh_sum[i * n + j] = 0;
-        d_c.Set(i, j, 0);
+      if (threadIdx.x == 0) {
+        d_c.Set(i, j, bias != nullptr ? bias[j] : 0);
       }
-    }
-  }
-  __syncthreads();
-
-  for (int i = 0; i < m * n; i++) {
-    atomicAdd(&sh_sum[i], local_sum[i]);
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    for (int i = 0; i < m; i++) {
-      for (int j = 0; j < n; j++) {
-        d_c.Add(i, j, sh_sum[i * n + j] + (bias != nullptr ? bias[j] : 0));
-      }
+      __syncthreads();
+      d_c.Add(i, j, thread_sum);
     }
   }
 }
@@ -345,12 +325,12 @@ void MatrixMul(M1 a, M2 b, M3 c, T *bias, cudaStream_t stream) {
   uint32_t n = c.layout.matrix_width;
   uint32_t k = a.layout.matrix_width;
 
-  if (m * n <= 1024) {
-    dim3 block = {32, 1, 1};
-    dim3 grid = {256, 1, 1};
-    int shared_bytes = m * n * sizeof(T);
-    MatrixMulTallAndSkinny<T, 1024>
-        <<<grid, block, shared_bytes, stream>>>(m, n, k, a, b, c, bias);
+  if (m * n <= 65536) {
+    static constexpr int block_size = 256;
+    dim3 block = {block_size, 1, 1};
+    dim3 grid = {64, 64, 1};
+    MatrixMulTallAndSkinny<T, block_size>
+        <<<grid, block, 0, stream>>>(m, n, k, a, b, c, bias);
   } else {
     static constexpr uint32_t block_size_m = 64, block_size_n = 64,
                               block_size_k = 8;
@@ -676,7 +656,7 @@ struct BenchConvBackwardParams : public BenchParams {
     auto h_b = Random(d_weight, k * n);
     auto h_bias = Random(d_output_grad, m * n);
 
-    float ms0, ms1 = 0;
+    float ms0 = 0, ms1 = 0;
     for (int i = 0; i < num_runs; i++) {
       auto res = ConvBackwardImplicitGEMM<float>(
           batch_size, input_channels, height, width, kernel_height,
