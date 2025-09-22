@@ -298,23 +298,48 @@ __global__ void MatrixMulGeneral(uint32_t m, uint32_t n, uint32_t k, M1 d_a,
   }
 }
 
-template <typename T, uint32_t block_size, typename M1, typename M2,
-          typename M3>
+template <typename T, uint32_t block_size, uint32_t block_size_k, typename M1,
+          typename M2, typename M3>
 __global__ void MatrixMulTallAndSkinny(uint32_t m, uint32_t n, uint32_t k,
                                        M1 d_a, M2 d_b, M3 d_c, T *bias) {
-  for (int i = blockIdx.x; i < m; i += gridDim.x) {
-    for (int j = blockIdx.y; j < n; j += gridDim.y) {
-      T thread_sum = 0.0;
+  extern __shared__ char shared[];
+  T *s_a_mem = (T *)shared;
+  T *s_b_mem = (T *)shared + block_size * block_size_k;
+  auto s_a = MatrixWrapper<T, ColMajorLayout>{
+      s_a_mem, ColMajorLayout(block_size, block_size_k)};
+  auto s_b = MatrixWrapper<T, RowMajorLayout>{
+      s_b_mem, RowMajorLayout(block_size_k, block_size)};
 
-      for (int idx = threadIdx.x; idx < k; idx += block_size) {
-        thread_sum += d_a.Get(i, idx) * d_b.Get(idx, j);
+  for (int i = blockIdx.x; i < (m + block_size - 1) / block_size;
+       i += gridDim.x) {
+    for (int j = blockIdx.y; j < (n + block_size - 1) / block_size;
+         j += gridDim.y) {
+      T regs[block_size * block_size] = {(T)0};
+
+      for (int idx = threadIdx.x; idx < k; idx += block_size_k) {
+        __syncthreads();
+        for (int p = 0; p < block_size; p++) {
+          s_a.Set(p, threadIdx.x, d_a.Get(i * block_size + p, idx));
+          s_b.Set(threadIdx.x, p, d_b.Get(idx, j * block_size + p));
+        }
+        __syncthreads();
+
+        for (int p = 0; p < block_size * block_size; p++) {
+          regs[p] += s_a.Get(p % block_size, threadIdx.x) *
+                     s_b.Get(threadIdx.x, p / block_size);
+        }
       }
 
       if (threadIdx.x == 0) {
-        d_c.Set(i, j, bias != nullptr ? bias[j] : 0);
+        for (int p = 0; p < block_size * block_size; p++)
+          d_c.Set(i * block_size + p % block_size,
+                  j * block_size + p / block_size,
+                  bias != nullptr ? bias[j * block_size + p / block_size] : 0);
       }
       __syncthreads();
-      d_c.Add(i, j, thread_sum);
+      for (int p = 0; p < block_size * block_size; p++)
+        d_c.Add(i * block_size + p % block_size,
+                j * block_size + p / block_size, regs[p]);
     }
   }
 }
@@ -325,12 +350,25 @@ void MatrixMul(M1 a, M2 b, M3 c, T *bias, cudaStream_t stream) {
   uint32_t n = c.layout.matrix_width;
   uint32_t k = a.layout.matrix_width;
 
-  if (m * n <= 65536) {
-    static constexpr int block_size = 256;
-    dim3 block = {block_size, 1, 1};
-    dim3 grid = {64, 64, 1};
-    MatrixMulTallAndSkinny<T, block_size>
-        <<<grid, block, 0, stream>>>(m, n, k, a, b, c, bias);
+  if (m * n <= 1024) {
+    static constexpr int block_size = 2;
+    static constexpr int block_size_k = 512;
+    dim3 block = {block_size_k, 1, 1};
+    dim3 grid = {16, 16, 1};
+    int shared_bytes = 2 * block_size * block_size_k * sizeof(T);
+    MatrixMulTallAndSkinny<T, block_size, block_size_k>
+        <<<grid, block, shared_bytes, stream>>>(m, n, k, a, b, c, bias);
+  } else if (m * n <= 65536) {
+    static constexpr uint32_t block_size_m = 32, block_size_n = 32,
+                              block_size_k = 32;
+    constexpr int num_warps = 8;
+    dim3 block = {32 * num_warps, 1, 1};
+    dim3 grid = {(m + block_size_m - 1) / block_size_m,
+                 (n + block_size_n - 1) / block_size_n, 1};
+    int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
+
+    MatrixMulGeneral<T, block_size_m, block_size_n, block_size_k, reduce>
+        <<<grid, block, shared_bytes, stream>>>(m, n, k, a, b, c, bias);
   } else {
     static constexpr uint32_t block_size_m = 64, block_size_n = 64,
                               block_size_k = 8;
@@ -773,15 +811,15 @@ struct BenchMatMulParams : public BenchParams {
 
 int main(int argc, char **argv) {
   auto suite = std::vector<BenchParams *>{
-      new BenchMatMulParams(1024, 1024, 1024),
-      new BenchMatMulParams(12544, 128, 288),
-      new BenchMatMulParams(3136, 32, 1152),
+      // new BenchMatMulParams(1024, 1024, 1024),
+      // new BenchMatMulParams(12544, 128, 288),
+      // new BenchMatMulParams(3136, 32, 1152),
       new BenchMatMulParams(9, 32, 64 * 28 * 28),
       new BenchConvBackwardParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
       new BenchConvBackwardParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
-      new BenchConvParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
-      new BenchConvParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
-      new BenchConvParams(64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32),
+      // new BenchConvParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
+      // new BenchConvParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
+      // new BenchConvParams(64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32),
   };
 
   int num_runs = 500;
