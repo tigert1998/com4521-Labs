@@ -10,23 +10,23 @@
 
 class ColMajorLayout {
  public:
-  int height, width;
-  __device__ __host__ ColMajorLayout(int height, int width)
-      : height(height), width(width) {}
+  int matrix_height, matrix_width;
+  __device__ __host__ ColMajorLayout(int matrix_height, int matrix_width)
+      : matrix_height(matrix_height), matrix_width(matrix_width) {}
   __device__ __host__ int Index(int x, int y) {
-    if (x < 0 || x >= height || y < 0 || y >= width) return -1;
-    return x + y * height;
+    if (x < 0 || x >= matrix_height || y < 0 || y >= matrix_width) return -1;
+    return x + y * matrix_height;
   }
 };
 
 class RowMajorLayout {
  public:
-  int height, width;
-  __device__ __host__ RowMajorLayout(int height, int width)
-      : height(height), width(width) {}
+  int matrix_height, matrix_width;
+  __device__ __host__ RowMajorLayout(int matrix_height, int matrix_width)
+      : matrix_height(matrix_height), matrix_width(matrix_width) {}
   __device__ __host__ int Index(int x, int y) {
-    if (x < 0 || x >= height || y < 0 || y >= width) return -1;
-    return x * width + y;
+    if (x < 0 || x >= matrix_height || y < 0 || y >= matrix_width) return -1;
+    return x * matrix_width + y;
   }
 };
 
@@ -114,116 +114,6 @@ __forceinline__ __device__ void ComputePrefetch(T *accum, int tx, int ty,
   }
   ComputeRegisters<T, block_size_m, block_size_n, thread_size_m, thread_size_n>(
       accum, l[(block_size_k - 1) % 2], r[(block_size_k - 1) % 2]);
-}
-
-template <typename T, uint32_t R, typename M1, typename M2, typename M3>
-__global__ void TallAndSkinnyMatrixMul(uint32_t m, uint32_t n, uint32_t k,
-                                       M1 d_a, M2 d_b, M3 d_c, T *bias) {
-  extern __shared__ char shared[];
-  T *sh_sum = (T *)shared;
-
-  int stride = blockDim.x * gridDim.x;
-
-  T local_sum[R] = {(T)0};
-  for (int p = threadIdx.x + blockIdx.x * blockDim.x; p < k; p += stride) {
-    for (int i = 0; i < m; i++) {
-      for (int j = 0; j < n; j++) {
-        local_sum[i * n + j] += d_a.Get(i, p) * d_b.Get(p, j);
-      }
-    }
-  }
-
-  int tid = threadIdx.x;
-  if (tid == 0) {
-    for (int i = 0; i < m; i++) {
-      for (int j = 0; j < n; j++) {
-        sh_sum[i * n + j] = 0;
-        d_c.Set(i, j, 0);
-      }
-    }
-  }
-  __syncthreads();
-
-  for (int i = 0; i < m * n; i++) {
-    atomicAdd(&sh_sum[i], local_sum[i]);
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    for (int i = 0; i < m; i++) {
-      for (int j = 0; j < n; j++) {
-        d_c.Add(i, j, sh_sum[i * n + j]);
-      }
-    }
-  }
-}
-
-template <typename T, uint32_t block_size_m, uint32_t block_size_n,
-          uint32_t block_size_k, bool reduce, typename M1, typename M2,
-          typename M3>
-__global__ void MatrixMul(uint32_t m, uint32_t n, uint32_t k, M1 d_a, M2 d_b,
-                          M3 d_c, T *bias) {
-  static constexpr uint32_t thread_size_m = block_size_m / 16;
-  static constexpr uint32_t thread_size_n = block_size_n / 16;
-
-  extern __shared__ char shared[];
-
-  static constexpr uint32_t num_warps = 8;
-
-  int lane_id = threadIdx.x % warpSize;
-  int warp_id = threadIdx.x / warpSize;
-
-  // z-order
-  // chinese doc: https://zhuanlan.zhihu.com/p/690052715
-  int tx = (warp_id / 2) * 4 + (lane_id % 8) / 2;
-  int ty = (warp_id % 2) * 8 + (lane_id / 8) * 2 + lane_id % 2;
-
-  int num_subs = (k + block_size_k - 1) / block_size_k;
-
-  T accum[thread_size_m * thread_size_n] = {(T)0};
-
-  T *s_a_mem = (T *)shared;
-  T *s_b_mem = (T *)shared + block_size_m * block_size_k;
-  auto s_a = MatrixWrapper<T, ColMajorLayout>{
-      s_a_mem, ColMajorLayout(block_size_m, block_size_k)};
-  auto s_b = MatrixWrapper<T, RowMajorLayout>{
-      s_b_mem, RowMajorLayout(block_size_k, block_size_n)};
-  for (int i = 0; i < num_subs; i++) {
-    __syncthreads();
-    StoreIntoSMEM<T, block_size_m, block_size_n, block_size_k>(
-        i, warp_id, lane_id, num_warps, d_a, d_b, s_a, s_b);
-    __syncthreads();
-    ComputePrefetch<T, block_size_m, block_size_n, block_size_k, thread_size_m,
-                    thread_size_n>(accum, tx, ty, s_a_mem, s_b_mem);
-  }
-
-  int offset_m = block_size_m * blockIdx.x;
-  int offset_n = block_size_n * blockIdx.y;
-
-  if constexpr (reduce) {
-#pragma unroll
-    for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
-      int x = offset_m + tx * thread_size_m + idx % thread_size_m;
-      int y = offset_n + ty * thread_size_n + idx / thread_size_m;
-      d_c.Set(x, y, (T)0);
-    }
-
-    __syncthreads();
-
-#pragma unroll
-    for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
-      int x = offset_m + tx * thread_size_m + idx % thread_size_m;
-      int y = offset_n + ty * thread_size_n + idx / thread_size_m;
-      d_c.Add(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
-    }
-  } else {
-#pragma unroll
-    for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
-      int x = offset_m + tx * thread_size_m + idx % thread_size_m;
-      int y = offset_n + ty * thread_size_n + idx / thread_size_m;
-      d_c.Set(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
-    }
-  }
 }
 
 class Im2colLayout {
@@ -341,31 +231,137 @@ class OutputLayout {
   }
 };
 
-template <typename T>
-void GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
-  MatrixWrapper<T, ColMajorLayout> a(input, ColMajorLayout(m, k));
-  MatrixWrapper<T, RowMajorLayout> b(weight, RowMajorLayout(k, n));
-  MatrixWrapper<T, ColMajorLayout> c(output, ColMajorLayout(m, n));
+template <typename T, uint32_t block_size_m, uint32_t block_size_n,
+          uint32_t block_size_k, bool reduce, typename M1, typename M2,
+          typename M3>
+__global__ void MatrixMulGeneral(uint32_t m, uint32_t n, uint32_t k, M1 d_a,
+                                 M2 d_b, M3 d_c, T *bias) {
+  static constexpr uint32_t thread_size_m = block_size_m / 16;
+  static constexpr uint32_t thread_size_n = block_size_n / 16;
+
+  extern __shared__ char shared[];
+
+  static constexpr uint32_t num_warps = 8;
+
+  int lane_id = threadIdx.x % warpSize;
+  int warp_id = threadIdx.x / warpSize;
+
+  // z-order
+  // chinese doc: https://zhuanlan.zhihu.com/p/690052715
+  int tx = (warp_id / 2) * 4 + (lane_id % 8) / 2;
+  int ty = (warp_id % 2) * 8 + (lane_id / 8) * 2 + lane_id % 2;
+
+  int num_subs = (k + block_size_k - 1) / block_size_k;
+
+  T accum[thread_size_m * thread_size_n] = {(T)0};
+
+  T *s_a_mem = (T *)shared;
+  T *s_b_mem = (T *)shared + block_size_m * block_size_k;
+  auto s_a = MatrixWrapper<T, ColMajorLayout>{
+      s_a_mem, ColMajorLayout(block_size_m, block_size_k)};
+  auto s_b = MatrixWrapper<T, RowMajorLayout>{
+      s_b_mem, RowMajorLayout(block_size_k, block_size_n)};
+  for (int i = 0; i < num_subs; i++) {
+    __syncthreads();
+    StoreIntoSMEM<T, block_size_m, block_size_n, block_size_k>(
+        i, warp_id, lane_id, num_warps, d_a, d_b, s_a, s_b);
+    __syncthreads();
+    ComputePrefetch<T, block_size_m, block_size_n, block_size_k, thread_size_m,
+                    thread_size_n>(accum, tx, ty, s_a_mem, s_b_mem);
+  }
+
+  int offset_m = block_size_m * blockIdx.x;
+  int offset_n = block_size_n * blockIdx.y;
+  if constexpr (reduce) {
+#pragma unroll
+    for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
+      int x = offset_m + tx * thread_size_m + idx % thread_size_m;
+      int y = offset_n + ty * thread_size_n + idx / thread_size_m;
+      d_c.Set(x, y, (T)0);
+    }
+
+    __syncthreads();
+
+#pragma unroll
+    for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
+      int x = offset_m + tx * thread_size_m + idx % thread_size_m;
+      int y = offset_n + ty * thread_size_n + idx / thread_size_m;
+      d_c.Add(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
+    }
+  } else {
+#pragma unroll
+    for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
+      int x = offset_m + tx * thread_size_m + idx % thread_size_m;
+      int y = offset_n + ty * thread_size_n + idx / thread_size_m;
+      d_c.Set(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
+    }
+  }
+}
+
+template <typename T, uint32_t R, typename M1, typename M2, typename M3>
+__global__ void MatrixMulTallAndSkinny(uint32_t m, uint32_t n, uint32_t k,
+                                       M1 d_a, M2 d_b, M3 d_c, T *bias) {
+  extern __shared__ char shared[];
+  T *sh_sum = (T *)shared;
+  int stride = blockDim.x * gridDim.x;
+
+  T local_sum[R] = {(T)0};
+  for (int p = threadIdx.x + blockIdx.x * blockDim.x; p < k; p += stride) {
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < n; j++) {
+        local_sum[i * n + j] += d_a.Get(i, p) * d_b.Get(p, j);
+      }
+    }
+  }
+
+  int tid = threadIdx.x;
+  if (tid == 0) {
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < n; j++) {
+        sh_sum[i * n + j] = 0;
+        d_c.Set(i, j, 0);
+      }
+    }
+  }
+  __syncthreads();
+
+  for (int i = 0; i < m * n; i++) {
+    atomicAdd(&sh_sum[i], local_sum[i]);
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < n; j++) {
+        d_c.Add(i, j, sh_sum[i * n + j] + (bias != nullptr ? bias[j] : 0));
+      }
+    }
+  }
+}
+
+template <typename T, bool reduce, typename M1, typename M2, typename M3>
+void MatrixMul(M1 a, M2 b, M3 c, T *bias, cudaStream_t stream) {
+  uint32_t m = c.layout.matrix_height;
+  uint32_t n = c.layout.matrix_width;
+  uint32_t k = a.layout.matrix_width;
 
   if (m * n <= 1024) {
     dim3 block = {32, 1, 1};
     dim3 grid = {256, 1, 1};
     int shared_bytes = m * n * sizeof(T);
-
-    TallAndSkinnyMatrixMul<T, 1024>
-        <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, nullptr);
+    MatrixMulTallAndSkinny<T, 1024>
+        <<<grid, block, shared_bytes, stream>>>(m, n, k, a, b, c, bias);
   } else {
     static constexpr uint32_t block_size_m = 64, block_size_n = 64,
-                              block_size_k = 32;
-
-    uint32_t num_warps = 8;
+                              block_size_k = 8;
+    constexpr int num_warps = 8;
     dim3 block = {32 * num_warps, 1, 1};
     dim3 grid = {(m + block_size_m - 1) / block_size_m,
                  (n + block_size_n - 1) / block_size_n, 1};
     int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
 
-    MatrixMul<T, block_size_m, block_size_n, block_size_k, false>
-        <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, nullptr);
+    MatrixMulGeneral<T, block_size_m, block_size_n, block_size_k, reduce>
+        <<<grid, block, shared_bytes, stream>>>(m, n, k, a, b, c, bias);
   }
 }
 
@@ -392,36 +388,17 @@ float ConvForwardImplicitGEMM(int batch_size, int input_channels, int height,
                              output_width);
   MatrixWrapper<T, OutputLayout> c(output, output_layout);
 
-  uint32_t m = batch_size * output_height * output_width;
-  uint32_t n = output_channels;
-  uint32_t k = input_channels * kernel_height * kernel_width;
-  static constexpr uint32_t block_size_m = 64, block_size_n = 64,
-                            block_size_k = 8;
-  uint32_t num_warps = 8;
-  dim3 block = {32 * num_warps, 1, 1};
-  dim3 grid = {(m + block_size_m - 1) / block_size_m,
-               (n + block_size_n - 1) / block_size_n, 1};
-  int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
-
   CudaTimer timer;
-  MatrixMul<T, block_size_m, block_size_n, block_size_k, false>
-      <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, bias);
+  MatrixMul<T, false>(a, b, c, bias, 0);
   return timer.End();
 }
 
 template <typename T>
-void ConvBackwardImplicitGEMM(int batch_size, int input_channels, int height,
-                              int width, int kernel_height, int kernel_width,
-                              int stride_height, int stride_width,
-                              int padding_height, int padding_width,
-                              int output_channels, T *input, T *weight,
-                              T *output_grad, T *input_grad, T *weight_grad) {
-  static constexpr uint32_t block_size_m = 64, block_size_n = 64,
-                            block_size_k = 8;
-  static constexpr int shared_bytes =
-      (block_size_m + block_size_n) * block_size_k * sizeof(T);
-  static constexpr uint32_t num_warps = 8;
-
+std::pair<float, float> ConvBackwardImplicitGEMM(
+    int batch_size, int input_channels, int height, int width,
+    int kernel_height, int kernel_width, int stride_height, int stride_width,
+    int padding_height, int padding_width, int output_channels, T *input,
+    T *weight, T *output_grad, T *input_grad, T *weight_grad) {
   int output_height =
       (height + 2 * padding_height - kernel_height) / stride_height + 1;
   int output_width =
@@ -454,25 +431,18 @@ void ConvBackwardImplicitGEMM(int batch_size, int input_channels, int height,
                                                     weight_grad_layout);
 
   // calculation
-  uint32_t m = input_grad_matrix.layout.matrix_height;
-  uint32_t n = input_grad_matrix.layout.matrix_width;
-  uint32_t k = c.layout.matrix_width;
-  dim3 block = {32 * num_warps, 1, 1};
-  dim3 grid = {(m + block_size_m - 1) / block_size_m,
-               (n + block_size_n - 1) / block_size_n, 1};
-  MatrixMul<T, block_size_m, block_size_n, block_size_k, true>
-      <<<grid, block, shared_bytes>>>(m, n, k, c, b, input_grad_matrix,
-                                      nullptr);
-
-  m = weight_grad_matrix.layout.matrix_height;
-  n = weight_grad_matrix.layout.matrix_width;
-  k = a.layout.matrix_width;
-  block = {32 * num_warps, 1, 1};
-  grid = {(m + block_size_m - 1) / block_size_m,
-          (n + block_size_n - 1) / block_size_n, 1};
-  MatrixMul<T, block_size_m, block_size_n, block_size_k, false>
-      <<<grid, block, shared_bytes>>>(m, n, k, a, c, weight_grad_matrix,
-                                      nullptr);
+  float ms0, ms1;
+  {
+    CudaTimer timer;
+    MatrixMul<T, true>(c, b, input_grad_matrix, nullptr, 0);
+    ms0 = timer.End();
+  }
+  {
+    CudaTimer timer;
+    MatrixMul<T, false>(a, c, weight_grad_matrix, nullptr, 0);
+    ms1 = timer.End();
+  }
+  return {ms0, ms1};
 }
 
 template <typename T>
@@ -706,25 +676,24 @@ struct BenchConvBackwardParams : public BenchParams {
     auto h_b = Random(d_weight, k * n);
     auto h_bias = Random(d_output_grad, m * n);
 
-    float total = 0;
+    float ms0, ms1 = 0;
     for (int i = 0; i < num_runs; i++) {
-      CudaTimer timer;
-
-      ConvBackwardImplicitGEMM<float>(
+      auto res = ConvBackwardImplicitGEMM<float>(
           batch_size, input_channels, height, width, kernel_height,
           kernel_width, stride_height, stride_width, padding_height,
           padding_width, output_channels, d_input, d_weight, d_output_grad,
           d_input_grad, d_weight_grad);
-
-      total += timer.End();
+      ms0 += res.first;
+      ms1 += res.second;
     }
-    float ms = total / num_runs;
+    ms0 /= num_runs;
+    ms1 /= num_runs;
 
-    float flops =
-        2.0f * batch_size * output_height * output_width * input_channels *
-            kernel_height * kernel_width * output_channels +
-        2.0f * input_channels * kernel_height * kernel_width * output_channels *
-            batch_size * output_height * output_width;
+    float flops0 = 2.0f * batch_size * output_height * output_width *
+                   input_channels * kernel_height * kernel_width *
+                   output_channels;
+    float flops1 = 2.0f * input_channels * kernel_height * kernel_width *
+                   output_channels * batch_size * output_height * output_width;
 
     printf("[Workload] m = %d, n = %d, k = %d & m = %d, n = %d, k = %d\n",
            batch_size * output_height * output_width,
@@ -732,8 +701,10 @@ struct BenchConvBackwardParams : public BenchParams {
            input_channels * kernel_height * kernel_width, output_channels,
            batch_size * output_height * output_width);
     printf("#runs = %d\n", num_runs);
-    printf("ConvBackwardImplicitGEMM: %.3fms\n", ms);
-    printf("%.3f GFLOPs\n\n", flops * 1e3 / (float)(1 << 30) / ms);
+    printf("ConvBackwardImplicitGEMM: %.3fms, %.3fms\n", ms0, ms1);
+    printf("%.3f GFLOPs, %.3f GFLOPs\n\n",
+           flops0 * 1e3 / (float)(1 << 30) / ms0,
+           flops1 * 1e3 / (float)(1 << 30) / ms1);
 
     cudaFree(d_input);
     cudaFree(d_weight);
@@ -793,10 +764,14 @@ struct BenchMatMulParams : public BenchParams {
     auto h_a = Random(d_a, m * k);
     auto h_b = Random(d_b, k * n);
 
+    MatrixWrapper<float, ColMajorLayout> a(d_a, ColMajorLayout(m, k));
+    MatrixWrapper<float, RowMajorLayout> b(d_b, RowMajorLayout(k, n));
+    MatrixWrapper<float, ColMajorLayout> c(d_c, ColMajorLayout(m, n));
+
     float total = 0;
     for (int i = 0; i < num_runs; i++) {
       CudaTimer timer;
-      GEMM<float>(m, n, k, d_a, d_b, d_c);
+      MatrixMul<float, false>(a, b, c, nullptr, 0);
       total += timer.End();
       CheckCUDAError("GEMM");
     }
@@ -823,6 +798,7 @@ int main(int argc, char **argv) {
       new BenchMatMulParams(3136, 32, 1152),
       new BenchMatMulParams(9, 32, 64 * 28 * 28),
       new BenchConvBackwardParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
+      new BenchConvBackwardParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
       new BenchConvParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
       new BenchConvParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
       new BenchConvParams(64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32),
