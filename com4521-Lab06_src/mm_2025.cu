@@ -13,7 +13,10 @@ class ColMajorLayout {
   int height, width;
   __device__ __host__ ColMajorLayout(int height, int width)
       : height(height), width(width) {}
-  __device__ __host__ int Index(int x, int y) { return x + y * height; }
+  __device__ __host__ int Index(int x, int y) {
+    if (x < 0 || x >= height || y < 0 || y >= width) return -1;
+    return x + y * height;
+  }
 };
 
 class RowMajorLayout {
@@ -21,7 +24,10 @@ class RowMajorLayout {
   int height, width;
   __device__ __host__ RowMajorLayout(int height, int width)
       : height(height), width(width) {}
-  __device__ __host__ int Index(int x, int y) { return x * width + y; }
+  __device__ __host__ int Index(int x, int y) {
+    if (x < 0 || x >= height || y < 0 || y >= width) return -1;
+    return x * width + y;
+  }
 };
 
 template <typename T, typename L>
@@ -111,7 +117,8 @@ __forceinline__ __device__ void ComputePrefetch(T *accum, int tx, int ty,
 }
 
 template <typename T, uint32_t block_size_m, uint32_t block_size_n,
-          uint32_t block_size_k, typename M1, typename M2, typename M3>
+          uint32_t block_size_k, bool reduce, typename M1, typename M2,
+          typename M3>
 __global__ void MatrixMul(uint32_t m, uint32_t n, uint32_t k, M1 d_a, M2 d_b,
                           M3 d_c, T *bias) {
   static constexpr uint32_t thread_size_m = block_size_m / 16;
@@ -151,20 +158,29 @@ __global__ void MatrixMul(uint32_t m, uint32_t n, uint32_t k, M1 d_a, M2 d_b,
   int offset_m = block_size_m * blockIdx.x;
   int offset_n = block_size_n * blockIdx.y;
 
+  if constexpr (reduce) {
 #pragma unroll
-  for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
-    int x = offset_m + tx * thread_size_m + idx % thread_size_m;
-    int y = offset_n + ty * thread_size_n + idx / thread_size_m;
-    d_c.Set(x, y, (T)0);
-  }
+    for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
+      int x = offset_m + tx * thread_size_m + idx % thread_size_m;
+      int y = offset_n + ty * thread_size_n + idx / thread_size_m;
+      d_c.Set(x, y, (T)0);
+    }
 
-  __syncthreads();
+    __syncthreads();
 
 #pragma unroll
-  for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
-    int x = offset_m + tx * thread_size_m + idx % thread_size_m;
-    int y = offset_n + ty * thread_size_n + idx / thread_size_m;
-    d_c.Add(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
+    for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
+      int x = offset_m + tx * thread_size_m + idx % thread_size_m;
+      int y = offset_n + ty * thread_size_n + idx / thread_size_m;
+      d_c.Add(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
+    }
+  } else {
+#pragma unroll
+    for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
+      int x = offset_m + tx * thread_size_m + idx % thread_size_m;
+      int y = offset_n + ty * thread_size_n + idx / thread_size_m;
+      d_c.Set(x, y, accum[idx] + (bias != nullptr ? bias[y] : 0));
+    }
   }
 }
 
@@ -299,7 +315,7 @@ float GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
   int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
 
   CudaTimer timer;
-  MatrixMul<T, block_size_m, block_size_n, block_size_k>
+  MatrixMul<T, block_size_m, block_size_n, block_size_k, false>
       <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, nullptr);
   CheckCUDAError("MatrixMul");
   return timer.End();
@@ -340,19 +356,18 @@ float ConvForwardImplicitGEMM(int batch_size, int input_channels, int height,
   int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
 
   CudaTimer timer;
-  MatrixMul<T, block_size_m, block_size_n, block_size_k>
+  MatrixMul<T, block_size_m, block_size_n, block_size_k, false>
       <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, bias);
-  CheckCUDAError("MatrixMul");
   return timer.End();
 }
 
 template <typename T>
-float ConvBackwardImplicitGEMM(int batch_size, int input_channels, int height,
-                               int width, int kernel_height, int kernel_width,
-                               int stride_height, int stride_width,
-                               int padding_height, int padding_width,
-                               int output_channels, T *input, T *weight,
-                               T *output_grad, T *input_grad, T *weight_grad) {
+void ConvBackwardImplicitGEMM(int batch_size, int input_channels, int height,
+                              int width, int kernel_height, int kernel_width,
+                              int stride_height, int stride_width,
+                              int padding_height, int padding_width,
+                              int output_channels, T *input, T *weight,
+                              T *output_grad, T *input_grad, T *weight_grad) {
   static constexpr uint32_t block_size_m = 64, block_size_n = 64,
                             block_size_k = 8;
   static constexpr int shared_bytes =
@@ -367,14 +382,17 @@ float ConvBackwardImplicitGEMM(int batch_size, int input_channels, int height,
   // tensors
   OutputLayout output_layout(batch_size, output_channels, output_height,
                              output_width);
-  MatrixWrapper<T, OutputLayout> c(output, output_layout);
+  MatrixWrapper<T, OutputLayout> c(output_grad, output_layout);
+  // bhw * cout
   WeightLayout weight_layout(output_channels, input_channels, kernel_height,
                              kernel_width, true);
   MatrixWrapper<T, WeightLayout> b(weight, weight_layout);
+  // cin k^2 * cout
   Im2colLayout im2col_layout(batch_size, input_channels, height, width,
                              kernel_height, kernel_width, stride_height,
                              stride_width, padding_height, padding_width, true);
   MatrixWrapper<T, Im2colLayout> a(input, im2col_layout);
+  // bhw * cin k^2
 
   // grads
   Im2colLayout input_grad_layout(
@@ -394,7 +412,7 @@ float ConvBackwardImplicitGEMM(int batch_size, int input_channels, int height,
   dim3 block = {32 * num_warps, 1, 1};
   dim3 grid = {(m + block_size_m - 1) / block_size_m,
                (n + block_size_n - 1) / block_size_n, 1};
-  MatrixMul<T, block_size_m, block_size_n, block_size_k>
+  MatrixMul<T, block_size_m, block_size_n, block_size_k, true>
       <<<grid, block, shared_bytes>>>(m, n, k, c, b, input_grad_matrix,
                                       nullptr);
 
@@ -404,7 +422,7 @@ float ConvBackwardImplicitGEMM(int batch_size, int input_channels, int height,
   block = {32 * num_warps, 1, 1};
   grid = {(m + block_size_m - 1) / block_size_m,
           (n + block_size_n - 1) / block_size_n, 1};
-  MatrixMul<T, block_size_m, block_size_n, block_size_k>
+  MatrixMul<T, block_size_m, block_size_n, block_size_k, false>
       <<<grid, block, shared_bytes>>>(m, n, k, a, c, weight_grad_matrix,
                                       nullptr);
 }
@@ -546,7 +564,7 @@ struct BenchConvParams : public BenchParams {
         (height + 2 * padding_height - kernel_height) / stride_height + 1;
     int output_width =
         (width + 2 * padding_width - kernel_width) / stride_width + 1;
-    int m = batch_size * height * width;
+    int m = batch_size * output_height * output_width;
     int n = output_channels;
     int k = input_channels * kernel_height * kernel_width;
 
@@ -578,13 +596,102 @@ struct BenchConvParams : public BenchParams {
                             stride_width, padding_height, padding_width,
                             output_channels, h_a, h_b, h_bias, d_c);
 
-    printf("ConvForwardImplicitGEMM Conv: %.3fms\n", ms);
+    printf("ConvForwardImplicitGEMM: %.3fms\n", ms);
     printf("%.3f GFLOPs\n\n", flops * 1e3 / (float)(1 << 30) / ms);
 
     cudaFree(d_a);
     cudaFree(d_b);
     cudaFree(d_c);
     cudaFree(d_bias);
+  }
+};
+
+struct BenchConvBackwardParams : public BenchParams {
+  int batch_size;
+  int input_channels;
+  int height;
+  int width;
+  int kernel_height;
+  int kernel_width;
+  int stride_height;
+  int stride_width;
+  int padding_height;
+  int padding_width;
+  int output_channels;
+
+  BenchConvBackwardParams(int batch_size, int input_channels, int height,
+                          int width, int kernel_height, int kernel_width,
+                          int stride_height, int stride_width,
+                          int padding_height, int padding_width,
+                          int output_channels)
+      : batch_size(batch_size),
+        input_channels(input_channels),
+        height(height),
+        width(width),
+        kernel_height(kernel_height),
+        kernel_width(kernel_width),
+        stride_height(stride_height),
+        stride_width(stride_width),
+        padding_height(padding_height),
+        padding_width(padding_width),
+        output_channels(output_channels) {}
+
+  ~BenchConvBackwardParams() override {}
+
+  void Benchmark(int num_runs) override {
+    float *d_input, *d_weight, *d_input_grad, *d_weight_grad, *d_output_grad;
+
+    int output_height =
+        (height + 2 * padding_height - kernel_height) / stride_height + 1;
+    int output_width =
+        (width + 2 * padding_width - kernel_width) / stride_width + 1;
+    int m = batch_size * height * width;
+    int n = output_channels;
+    int k = input_channels * kernel_height * kernel_width;
+
+    cudaMalloc(&d_input, sizeof(float) * m * k);
+    cudaMalloc(&d_weight, sizeof(float) * k * n);
+    cudaMalloc(&d_input_grad, sizeof(float) * m * k);
+    cudaMalloc(&d_weight_grad, sizeof(float) * k * n);
+    cudaMalloc(&d_output_grad, sizeof(float) * m * n);
+    auto h_a = Random(d_input, m * k);
+    auto h_b = Random(d_weight, k * n);
+    auto h_bias = Random(d_output_grad, m * n);
+
+    float total = 0;
+    for (int i = 0; i < num_runs; i++) {
+      CudaTimer timer;
+
+      ConvBackwardImplicitGEMM<float>(
+          batch_size, input_channels, height, width, kernel_height,
+          kernel_width, stride_height, stride_width, padding_height,
+          padding_width, output_channels, d_input, d_weight, d_output_grad,
+          d_input_grad, d_weight_grad);
+
+      total += timer.End();
+    }
+    float ms = total / num_runs;
+
+    float flops =
+        2.0f * batch_size * output_height * output_width * input_channels *
+            kernel_height * kernel_width * output_channels +
+        2.0f * input_channels * kernel_height * kernel_width * output_channels *
+            batch_size * output_height * output_width;
+
+    printf("[Workload] m = %d, n = %d, k = %d & m = %d, n = %d, k = %d\n",
+           batch_size * output_height * output_width,
+           input_channels * kernel_height * kernel_width, output_channels,
+           input_channels * kernel_height * kernel_width, output_channels,
+           batch_size * output_height * output_width);
+    printf("#runs = %d\n", num_runs);
+    printf("ConvBackwardImplicitGEMM: %.3fms\n", ms);
+    printf("%.3f GFLOPs\n\n", flops * 1e3 / (float)(1 << 30) / ms);
+
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_input_grad);
+    cudaFree(d_weight_grad);
+    cudaFree(d_output_grad);
   }
 };
 
@@ -616,6 +723,7 @@ struct BenchMatMulParams : public BenchParams {
 
         int output_idx = j * m + i;
         if (abs(output[output_idx] - sum) >= 1e-3) {
+          num_mismatches += 1;
           if (num_mismatches < 8) {
             printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
                    output[output_idx], sum);
@@ -648,7 +756,7 @@ struct BenchMatMulParams : public BenchParams {
     CheckCorrectness<float>(h_a, h_b, d_c);
     printf("#runs = %d\n", num_runs);
 
-    printf("ConvForwardImplicitGEMM MatMul: %.3fms\n", ms);
+    printf("MatMul: %.3fms\n", ms);
     printf("%.3f GFLOPs\n\n", flops * 1e3 / (float)(1 << 30) / ms);
 
     cudaFree(d_a);
@@ -662,6 +770,8 @@ int main(int argc, char **argv) {
       new BenchMatMulParams(1024, 1024, 1024),
       new BenchMatMulParams(12544, 128, 288),
       new BenchMatMulParams(3136, 32, 1152),
+      new BenchMatMulParams(9, 32, 64 * 28 * 28),
+      new BenchConvBackwardParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
       new BenchConvParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
       new BenchConvParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
       new BenchConvParams(64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32),
