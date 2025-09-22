@@ -116,6 +116,48 @@ __forceinline__ __device__ void ComputePrefetch(T *accum, int tx, int ty,
       accum, l[(block_size_k - 1) % 2], r[(block_size_k - 1) % 2]);
 }
 
+template <typename T, uint32_t R, typename M1, typename M2, typename M3>
+__global__ void TallAndSkinnyMatrixMul(uint32_t m, uint32_t n, uint32_t k,
+                                       M1 d_a, M2 d_b, M3 d_c, T *bias) {
+  extern __shared__ char shared[];
+  T *sh_sum = (T *)shared;
+
+  int stride = blockDim.x * gridDim.x;
+
+  T local_sum[R] = {(T)0};
+  for (int p = threadIdx.x + blockIdx.x * blockDim.x; p < k; p += stride) {
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < n; j++) {
+        local_sum[i * n + j] += d_a.Get(i, p) * d_b.Get(p, j);
+      }
+    }
+  }
+
+  int tid = threadIdx.x;
+  if (tid == 0) {
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < n; j++) {
+        sh_sum[i * n + j] = 0;
+        d_c.Set(i, j, 0);
+      }
+    }
+  }
+  __syncthreads();
+
+  for (int i = 0; i < m * n; i++) {
+    atomicAdd(&sh_sum[i], local_sum[i]);
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < n; j++) {
+        d_c.Add(i, j, sh_sum[i * n + j]);
+      }
+    }
+  }
+}
+
 template <typename T, uint32_t block_size_m, uint32_t block_size_n,
           uint32_t block_size_k, bool reduce, typename M1, typename M2,
           typename M3>
@@ -300,25 +342,31 @@ class OutputLayout {
 };
 
 template <typename T>
-float GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
+void GEMM(uint32_t m, uint32_t n, uint32_t k, T *input, T *weight, T *output) {
   MatrixWrapper<T, ColMajorLayout> a(input, ColMajorLayout(m, k));
   MatrixWrapper<T, RowMajorLayout> b(weight, RowMajorLayout(k, n));
   MatrixWrapper<T, ColMajorLayout> c(output, ColMajorLayout(m, n));
 
-  static constexpr uint32_t block_size_m = 64, block_size_n = 64,
-                            block_size_k = 32;
+  if (m * n <= 1024) {
+    dim3 block = {32, 1, 1};
+    dim3 grid = {256, 1, 1};
+    int shared_bytes = m * n * sizeof(T);
 
-  uint32_t num_warps = 8;
-  dim3 block = {32 * num_warps, 1, 1};
-  dim3 grid = {(m + block_size_m - 1) / block_size_m,
-               (n + block_size_n - 1) / block_size_n, 1};
-  int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
+    TallAndSkinnyMatrixMul<T, 1024>
+        <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, nullptr);
+  } else {
+    static constexpr uint32_t block_size_m = 64, block_size_n = 64,
+                              block_size_k = 32;
 
-  CudaTimer timer;
-  MatrixMul<T, block_size_m, block_size_n, block_size_k, false>
-      <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, nullptr);
-  CheckCUDAError("MatrixMul");
-  return timer.End();
+    uint32_t num_warps = 8;
+    dim3 block = {32 * num_warps, 1, 1};
+    dim3 grid = {(m + block_size_m - 1) / block_size_m,
+                 (n + block_size_n - 1) / block_size_n, 1};
+    int shared_bytes = (block_size_m + block_size_n) * block_size_k * sizeof(T);
+
+    MatrixMul<T, block_size_m, block_size_n, block_size_k, false>
+        <<<grid, block, shared_bytes>>>(m, n, k, a, b, c, nullptr);
+  }
 }
 
 template <typename T>
@@ -747,9 +795,12 @@ struct BenchMatMulParams : public BenchParams {
 
     float total = 0;
     for (int i = 0; i < num_runs; i++) {
-      total += GEMM<float>(m, n, k, d_a, d_b, d_c);
+      CudaTimer timer;
+      GEMM<float>(m, n, k, d_a, d_b, d_c);
+      total += timer.End();
+      CheckCUDAError("GEMM");
     }
-    float flops = 2.0f * (double)m * (double)n * (double)k;
+    float flops = 2.0f * m * n * k;
     float ms = total / num_runs;
 
     printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
