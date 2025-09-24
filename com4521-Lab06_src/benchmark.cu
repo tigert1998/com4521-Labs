@@ -356,6 +356,11 @@ struct BenchMatMulParams : public BenchParams {
   template <typename T>
   void CheckCorrectness(const std::vector<T> &h_a, const std::vector<T> &h_b,
                         T *d_c) {
+    float eps = 1e-3;
+    if (std::is_same_v<T, __half>) {
+      eps = 1e-1;
+    }
+
     int num_mismatches = 0;
 
     std::vector<T> output(m * n);
@@ -371,11 +376,11 @@ struct BenchMatMulParams : public BenchParams {
         }
 
         int output_idx = j * m + i;
-        if (abs(output[output_idx] - sum) >= 1e-3) {
+        if (abs((float)output[output_idx] - (float)sum) >= eps) {
           num_mismatches += 1;
           if (num_mismatches < 8) {
             printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
-                   output[output_idx], sum);
+                   (float)output[output_idx], (float)sum);
           } else if (num_mismatches == 8) {
             printf("...\n");
           }
@@ -386,22 +391,24 @@ struct BenchMatMulParams : public BenchParams {
   }
 
   void Benchmark(int num_runs) override {
-    float *d_a, *d_b, *d_c;
+    using T = __half;
 
-    cudaMalloc(&d_a, sizeof(float) * m * k);
-    cudaMalloc(&d_b, sizeof(float) * k * n);
-    cudaMalloc(&d_c, sizeof(float) * m * n);
+    T *d_a, *d_b, *d_c;
+
+    cudaMalloc(&d_a, sizeof(T) * m * k);
+    cudaMalloc(&d_b, sizeof(T) * k * n);
+    cudaMalloc(&d_c, sizeof(T) * m * n);
     auto h_a = Random(d_a, m * k);
     auto h_b = Random(d_b, k * n);
 
-    MatrixWrapper<float, ColMajorLayout> a(d_a, ColMajorLayout(m, k));
-    MatrixWrapper<float, RowMajorLayout> b(d_b, RowMajorLayout(k, n));
-    MatrixWrapper<float, ColMajorLayout> c(d_c, ColMajorLayout(m, n));
+    MatrixWrapper<T, ColMajorLayout> a(d_a, ColMajorLayout(m, k));
+    MatrixWrapper<T, RowMajorLayout> b(d_b, RowMajorLayout(k, n));
+    MatrixWrapper<T, ColMajorLayout> c(d_c, ColMajorLayout(m, n));
 
     float total = 0;
     for (int i = 0; i < num_runs; i++) {
       CudaTimer timer;
-      MatrixMul<float, false>(a, b, c, nullptr, 0);
+      MatrixMul<T, false>(a, b, c, nullptr, 0);
       total += timer.End();
       CheckCUDAError("GEMM");
     }
@@ -409,7 +416,7 @@ struct BenchMatMulParams : public BenchParams {
     float ms = total / num_runs;
 
     printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
-    CheckCorrectness<float>(h_a, h_b, d_c);
+    CheckCorrectness<T>(h_a, h_b, d_c);
     printf("#runs = %d\n", num_runs);
 
     printf("MatMul: %.3fms\n", ms);
@@ -423,12 +430,12 @@ struct BenchMatMulParams : public BenchParams {
 
 int main(int argc, char **argv) {
   auto suite = std::vector<BenchParams *>{
-      // new BenchMatMulParams(1024, 1024, 1024),
+      new BenchMatMulParams(512, 512, 512),
       // new BenchMatMulParams(12544, 128, 288),
       // new BenchMatMulParams(3136, 32, 1152),
-      new BenchMatMulParams(9, 32, 64 * 28 * 28),
-      new BenchConvBackwardParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
-      new BenchConvBackwardParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
+      // new BenchMatMulParams(9, 32, 64 * 28 * 28),
+      // new BenchConvBackwardParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
+      // new BenchConvBackwardParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
       // new BenchConvParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
       // new BenchConvParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
       // new BenchConvParams(64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32),
