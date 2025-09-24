@@ -1,3 +1,4 @@
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -354,40 +355,52 @@ struct BenchMatMulParams : public BenchParams {
   ~BenchMatMulParams() override {}
 
   template <typename T>
-  void CheckCorrectness(const std::vector<T> &h_a, const std::vector<T> &h_b,
-                        T *d_c) {
+  void CheckCorrectness(T *d_a, T *d_b, T *d_c) {
     float eps = 1e-3;
     if (std::is_same_v<T, __half>) {
       eps = 1e-1;
     }
 
-    int num_mismatches = 0;
+    T *d_c_ref;
+    cudaMalloc(&d_c_ref, m * n * sizeof(T));
+    CheckCUDAError("cudaMalloc");
 
-    std::vector<T> output(m * n);
-    cudaMemcpy(output.data(), d_c, output.size() * sizeof(T),
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    CheckCUDAError("cublasCreate");
+    T alpha = 1, beta = 0;
+
+    float total_ms = 0;
+    int num_runs = 500;
+    for (int i = 0; i < num_runs; i++) {
+      CudaTimer timer;
+      if constexpr (std::is_same_v<T, __half>) {
+        cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, m, n, k, &alpha, d_a, m,
+                    d_b, n, &beta, d_c_ref, m);
+      } else {
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, m, n, k, &alpha, d_a, m,
+                    d_b, n, &beta, d_c_ref, m);
+      }
+      total_ms += timer.End();
+    }
+    float ms = total_ms / num_runs;
+
+    std::vector<T> c(m * n);
+    cudaMemcpy(c.data(), d_c, c.size() * sizeof(T), cudaMemcpyDeviceToHost);
+    CheckCUDAError("cudaMemcpy cudaMemcpyDeviceToHost");
+    std::vector<T> c_ref(m * n);
+    cudaMemcpy(c_ref.data(), d_c_ref, c_ref.size() * sizeof(T),
                cudaMemcpyDeviceToHost);
     CheckCUDAError("cudaMemcpy cudaMemcpyDeviceToHost");
 
-    for (int i = 0; i < m; i++)
-      for (int j = 0; j < n; j++) {
-        T sum = 0;
-        for (int iter = 0; iter < k; iter++) {
-          sum += h_a[iter * m + i] * h_b[iter * n + j];
-        }
-
-        int output_idx = j * m + i;
-        if (abs((float)output[output_idx] - (float)sum) >= eps) {
-          num_mismatches += 1;
-          if (num_mismatches < 8) {
-            printf("output[%d] mismatch: %.3f vs %.3f\n", output_idx,
-                   (float)output[output_idx], (float)sum);
-          } else if (num_mismatches == 8) {
-            printf("...\n");
-          }
-        }
-      }
-
+    int num_mismatches = 0;
+    for (int i = 0; i < m * n; i++)
+      num_mismatches += abs((float)c[i] - (float)c_ref[i]) >= eps;
+    printf("cublas: %.3fms\n", ms);
+    printf("cublas %.3f GFLOPs\n", 1.0 * m * n * k * 2 * 1e3 / (1 << 30) / ms);
     printf("#mismatches: %d\n", num_mismatches);
+
+    cudaFree(d_c_ref);
   }
 
   void Benchmark(int num_runs) override {
@@ -398,8 +411,8 @@ struct BenchMatMulParams : public BenchParams {
     cudaMalloc(&d_a, sizeof(T) * m * k);
     cudaMalloc(&d_b, sizeof(T) * k * n);
     cudaMalloc(&d_c, sizeof(T) * m * n);
-    auto h_a = Random(d_a, m * k);
-    auto h_b = Random(d_b, k * n);
+    Random(d_a, m * k);
+    Random(d_b, k * n);
 
     MatrixWrapper<T, ColMajorLayout> a(d_a, ColMajorLayout(m, k));
     MatrixWrapper<T, RowMajorLayout> b(d_b, RowMajorLayout(k, n));
@@ -416,7 +429,7 @@ struct BenchMatMulParams : public BenchParams {
     float ms = total / num_runs;
 
     printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
-    CheckCorrectness<T>(h_a, h_b, d_c);
+    CheckCorrectness<T>(d_a, d_b, d_c);
     printf("#runs = %d\n", num_runs);
 
     printf("MatMul: %.3fms\n", ms);
@@ -430,7 +443,7 @@ struct BenchMatMulParams : public BenchParams {
 
 int main(int argc, char **argv) {
   auto suite = std::vector<BenchParams *>{
-      new BenchMatMulParams(512, 512, 512),
+      new BenchMatMulParams(1024, 1024, 1024),
       // new BenchMatMulParams(12544, 128, 288),
       // new BenchMatMulParams(3136, 32, 1152),
       // new BenchMatMulParams(9, 32, 64 * 28 * 28),
