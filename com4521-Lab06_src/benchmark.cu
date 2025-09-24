@@ -355,7 +355,7 @@ struct BenchMatMulParams : public BenchParams {
   ~BenchMatMulParams() override {}
 
   template <typename T>
-  void CheckCorrectness(T *d_a, T *d_b, T *d_c) {
+  void CheckCorrectness(T *d_a, T *d_b, T *d_c, int num_runs) {
     float eps = 1e-3;
     if (std::is_same_v<T, __half>) {
       eps = 1e-1;
@@ -370,8 +370,12 @@ struct BenchMatMulParams : public BenchParams {
     CheckCUDAError("cublasCreate");
     T alpha = 1, beta = 0;
 
+    if constexpr (std::is_same_v<T, __half>) {
+      printf("cublasHgemm\n");
+    } else {
+      printf("cublasSgemm\n");
+    }
     float total_ms = 0;
-    int num_runs = 500;
     for (int i = 0; i < num_runs; i++) {
       CudaTimer timer;
       if constexpr (std::is_same_v<T, __half>) {
@@ -404,7 +408,7 @@ struct BenchMatMulParams : public BenchParams {
   }
 
   void Benchmark(int num_runs) override {
-    using T = __half;
+    using T = float;
 
     T *d_a, *d_b, *d_c;
 
@@ -429,7 +433,7 @@ struct BenchMatMulParams : public BenchParams {
     float ms = total / num_runs;
 
     printf("[Workload] m = %d, n = %d, k = %d\n", m, n, k);
-    CheckCorrectness<T>(d_a, d_b, d_c);
+    CheckCorrectness<T>(d_a, d_b, d_c, num_runs);
     printf("#runs = %d\n", num_runs);
 
     printf("MatMul: %.3fms\n", ms);
@@ -443,7 +447,7 @@ struct BenchMatMulParams : public BenchParams {
 
 int main(int argc, char **argv) {
   auto suite = std::vector<BenchParams *>{
-      new BenchMatMulParams(1024, 1024, 1024),
+      new BenchMatMulParams(4096, 4096, 4096),
       // new BenchMatMulParams(12544, 128, 288),
       // new BenchMatMulParams(3136, 32, 1152),
       // new BenchMatMulParams(9, 32, 64 * 28 * 28),
