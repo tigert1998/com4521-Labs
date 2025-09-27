@@ -35,7 +35,7 @@ void MatrixMul(M1 a, M2 b, M3 c, T *bias, cudaStream_t stream) {
           <<<grid, block, shared_bytes, stream>>>(m, n, k, a, b, c, bias);
     } else if (m * n <= 65536) {
       static constexpr uint32_t block_size_m = 32, block_size_n = 32,
-                                block_size_k = 32;
+                                block_size_k = 64;
       constexpr int num_warps = 8;
       dim3 block = {32 * num_warps, 1, 1};
       dim3 grid = {(m + block_size_m - 1) / block_size_m,
@@ -47,7 +47,7 @@ void MatrixMul(M1 a, M2 b, M3 c, T *bias, cudaStream_t stream) {
           <<<grid, block, shared_bytes, stream>>>(m, n, k, a, b, c, bias);
     } else {
       static constexpr uint32_t block_size_m = 64, block_size_n = 64,
-                                block_size_k = 8;
+                                block_size_k = 32;
       constexpr int num_warps = 8;
       dim3 block = {32 * num_warps, 1, 1};
       dim3 grid = {(m + block_size_m - 1) / block_size_m,

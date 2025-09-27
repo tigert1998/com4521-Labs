@@ -5,16 +5,14 @@
 template <typename T, uint32_t block_size_m, uint32_t block_size_n,
           uint32_t block_size_k, typename M1, typename M2>
 __forceinline__ __device__ void StoreIntoSMEM(
-    int i, int warp_id, int lane_id, int num_warps, M1 d_a, M2 d_b,
-    MatrixWrapper<T, ColMajorLayout> s_a,
+    int i, M1 d_a, M2 d_b, MatrixWrapper<T, ColMajorLayout> s_a,
     MatrixWrapper<T, RowMajorLayout> s_b) {
   int offset_m = block_size_m * blockIdx.x;
   int offset_n = block_size_n * blockIdx.y;
 
 #pragma unroll
-  for (int j = warp_id * warpSize + lane_id;
-       j < max(block_size_m, block_size_n) * block_size_k;
-       j += num_warps * warpSize) {
+  for (int j = threadIdx.x; j < max(block_size_m, block_size_n) * block_size_k;
+       j += blockDim.x) {
     if (j < block_size_m * block_size_k) {
       int x = j % block_size_m, y = j / block_size_m;
       s_a.SetNoCheck(x, y, d_a.Get(offset_m + x, (block_size_k * (i)) + y));
@@ -38,8 +36,7 @@ __forceinline__ __device__ void LoadFromSMEM(T *l, T *r, T *s_a_mem, T *s_b_mem,
     r[k] = *(s_b_mem + (j)*block_size_n + ty * thread_size_n + k);
 }
 
-template <typename T, uint32_t block_size_m, uint32_t block_size_n,
-          uint32_t thread_size_m, uint32_t thread_size_n>
+template <typename T, uint32_t thread_size_m, uint32_t thread_size_n>
 __forceinline__ __device__ void ComputeRegisters(T *accum, T *l, T *r) {
 #pragma unroll
   for (int idx = 0; idx < thread_size_m * thread_size_n; idx++) {
@@ -49,19 +46,14 @@ __forceinline__ __device__ void ComputeRegisters(T *accum, T *l, T *r) {
 
 template <typename T, uint32_t block_size_m, uint32_t block_size_n,
           uint32_t block_size_k, uint32_t thread_size_m, uint32_t thread_size_n>
-__forceinline__ __device__ void ComputePrefetch(T *accum, int tx, int ty,
-                                                T *s_a_mem, T *s_b_mem) {
-  T l[2][thread_size_m], r[2][thread_size_n];
-  LoadFromSMEM<T, block_size_m, block_size_n, thread_size_m, thread_size_n>(
-      l[0], r[0], s_a_mem, s_b_mem, tx, ty, 0);
-  for (int j = 0; j < block_size_k - 1; j++) {
+__forceinline__ __device__ void Compute(T *accum, int tx, int ty, T *s_a_mem,
+                                        T *s_b_mem) {
+  T l[thread_size_m], r[thread_size_n];
+  for (int j = 0; j < block_size_k; j++) {
     LoadFromSMEM<T, block_size_m, block_size_n, thread_size_m, thread_size_n>(
-        l[(j + 1) % 2], r[(j + 1) % 2], s_a_mem, s_b_mem, tx, ty, j + 1);
-    ComputeRegisters<T, block_size_m, block_size_n, thread_size_m,
-                     thread_size_n>(accum, l[j % 2], r[j % 2]);
+        l, r, s_a_mem, s_b_mem, tx, ty, j);
+    ComputeRegisters<T, thread_size_m, thread_size_n>(accum, l, r);
   }
-  ComputeRegisters<T, block_size_m, block_size_n, thread_size_m, thread_size_n>(
-      accum, l[(block_size_k - 1) % 2], r[(block_size_k - 1) % 2]);
 }
 
 template <typename T, uint32_t block_size_m, uint32_t block_size_n,
@@ -96,11 +88,11 @@ __global__ void MatrixMulGeneral(uint32_t m, uint32_t n, uint32_t k, M1 d_a,
       s_b_mem, RowMajorLayout(block_size_k, block_size_n)};
   for (int i = 0; i < num_subs; i++) {
     __syncthreads();
-    StoreIntoSMEM<T, block_size_m, block_size_n, block_size_k>(
-        i, warp_id, lane_id, num_warps, d_a, d_b, s_a, s_b);
+    StoreIntoSMEM<T, block_size_m, block_size_n, block_size_k>(i, d_a, d_b, s_a,
+                                                               s_b);
     __syncthreads();
-    ComputePrefetch<T, block_size_m, block_size_n, block_size_k, thread_size_m,
-                    thread_size_n>(accum, tx, ty, s_a_mem, s_b_mem);
+    Compute<T, block_size_m, block_size_n, block_size_k, thread_size_m,
+            thread_size_n>(accum, tx, ty, s_a_mem, s_b_mem);
   }
 
   int offset_m = block_size_m * blockIdx.x;

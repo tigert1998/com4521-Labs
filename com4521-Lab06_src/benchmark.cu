@@ -448,14 +448,14 @@ struct BenchMatMulParams : public BenchParams {
 int main(int argc, char **argv) {
   auto suite = std::vector<BenchParams *>{
       new BenchMatMulParams(4096, 4096, 4096),
-      // new BenchMatMulParams(12544, 128, 288),
-      // new BenchMatMulParams(3136, 32, 1152),
-      // new BenchMatMulParams(9, 32, 64 * 28 * 28),
-      // new BenchConvBackwardParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
-      // new BenchConvBackwardParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
-      // new BenchConvParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
-      // new BenchConvParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
-      // new BenchConvParams(64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32),
+      new BenchMatMulParams(12544, 128, 288),
+      new BenchMatMulParams(3136, 32, 1152),
+      new BenchMatMulParams(9, 32, 64 * 28 * 28),
+      new BenchConvBackwardParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
+      new BenchConvBackwardParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
+      new BenchConvParams(64, 1, 28, 28, 3, 3, 1, 1, 1, 1, 32),
+      new BenchConvParams(64, 32, 14, 14, 3, 3, 1, 1, 1, 1, 128),
+      new BenchConvParams(64, 128, 7, 7, 3, 3, 1, 1, 1, 1, 32),
   };
 
   int num_runs = 500;
